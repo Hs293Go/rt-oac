@@ -16,7 +16,7 @@ dependencies = [
   "numpy",
   "matplotlib>=3.10",
   "tqdm",
-  # real-time visualization for the headline sim (matches the companion repo's rerun
+  # real-time visualization for the headline examples (matches the companion repo's rerun
   # version so its example_lib.visualization helpers and logging APIs line up exactly)
   "rerun-sdk==0.24.1",
   # The companion repo, as a local editable dependency (see [tool.uv.sources]). The

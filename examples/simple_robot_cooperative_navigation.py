@@ -1,4 +1,4 @@
-"""Headline example: real-time planar leader-follower cooperative navigation with EKF.
+"""Headline example: real-time planar leader-follower cooperative navigation, with rerun.
 
 The future-work counterpart of the companion repo's
 ``examples/simple_robot_cooperative_navigation.py``. Same planar unicycle leader-follower
@@ -9,23 +9,37 @@ re-anchored the estimate to truth each step.
 
 Frontier method: **log-det** objective + **SLSQP** early-stopped at 6 iters. Compares
 observability-aware control against a no-OAC follower (drives straight) on closed-loop EKF
-estimation accuracy, from a large initial follower-position error. Validated result:
-OAC drives the unobservable initial error down (~13x lower final error, ~20x tighter
-covariance) where no-OAC cannot, at ~3 ms/solve. See ``PROGRESS.md`` / ``results/RESULTS.md``.
+estimation accuracy, from a large initial follower-position error. Measured result:
+OAC drives the unobservable initial error down (~5x lower final error, 0.79 -> 0.16 m;
+~3.3x lower RMSE, 0.80 -> 0.24 m) where no-OAC cannot, at ~3 ms/solve. See ``PROGRESS.md``
+/ ``results/RESULTS.md``.
 
-Run:  uv run python examples/simple_robot_cooperative_navigation.py
+Visualization is **rerun**, mirroring the companion repo's examples: a live 2D scene of the
+leader, the true follower, the EKF estimate and its shrinking 3-sigma covariance ellipse,
+plus live time-series of the OAC-vs-no-OAC estimation error, the accumulated observability,
+the solve time, and the inter-robot distance. A comprehensive multi-panel matplotlib figure
+is rendered after the run.
+
+Live viewer:    uv run python examples/simple_robot_cooperative_navigation.py --spawn
+Headless (default; writes results/example_planar.rrd + .png):
+                uv run python examples/simple_robot_cooperative_navigation.py
 """
 
+import argparse
+import functools
 import pathlib
-import time
 
 from example_lib.misc import simple_ekf
 from example_lib.models import leader_follower_robots as mdl
+from example_lib.visualization import visualization as viz
 import jax
 import jax.numpy as jnp
 import matplotlib as mpl
 import numpy as np
 from observability_aware_control import integrator, observability_cost
+import rerun as rr
+import rerun.blueprint as rrb
+import tqdm
 
 import rt_oac  # noqa: F401
 from rt_oac import metrics
@@ -44,6 +58,10 @@ LEADER_U = np.array([1.0, 0.0])
 STEPS = 120
 SEED = 0
 INIT_FOLLOWER_OFFSET = np.array([0.0, 0.0, 0.0, 1.6, 1.6, 0.0])  # ~2.3 m initial error
+DIST_BOUNDS = (0.2, 6.0)
+RESULTS = pathlib.Path(__file__).resolve().parents[1] / "results"
+
+PureYaw = functools.partial(rr.RotationAxisAngle, axis=[0, 0, 1])
 
 
 def build_controller():
@@ -55,7 +73,7 @@ def build_controller():
         gramian_metric=metrics.neg_logdet,
         observed_indices=(),
     )
-    return RTController(
+    ctrl = RTController(
         cost,
         stlog_dt=STLOG_DT,
         lb=np.array([0.0, -2.0]),
@@ -65,11 +83,29 @@ def build_controller():
         method="SLSQP",
         maxiter=6,
         constraint=mdl.interrobot_distance,
-        constraint_bounds=(0.2, 6.0),
+        constraint_bounds=DIST_BOUNDS,
     )
+    return ctrl, cost
 
 
-def run(use_oac, ctrl):
+def cov_ellipse(center2, P2, nsig=3.0, n=48):
+    """3-sigma covariance ellipse as (n,3) points in the z=0 plane."""
+    vals, vecs = np.linalg.eigh(0.5 * (P2 + P2.T))
+    vals = np.clip(vals, 0.0, None)
+    t = np.linspace(0, 2 * np.pi, n)
+    circ = np.stack([np.cos(t), np.sin(t)])
+    pts = (vecs @ (nsig * np.sqrt(vals)[:, None] * circ)).T + np.asarray(center2)
+    return np.column_stack([pts, np.zeros(n)])
+
+
+def _acc_min_eig(gram, x, u):
+    g = np.asarray(gram(jnp.asarray(x), u))
+    acc = 0.5 * (g + np.swapaxes(g, -1, -2)).sum(0)
+    return float(np.linalg.eigvalsh(acc)[0])
+
+
+def run(use_oac, ctrl, gram, *, stream=False, noac_err=None):
+    """One closed-loop run. If ``stream``, log it live to rerun (overlaying ``noac_err``)."""
     rng = np.random.default_rng(SEED)
     sim = jax.jit(
         integrator.Integrator(mdl.dynamics, integrator.Methods.RK4, stepsize=DT)
@@ -83,18 +119,40 @@ def run(use_oac, ctrl):
     x_true = X0.copy()
     P = np.diag([1e-3, 1e-3, 1e-3, 2.0, 2.0, 1e-2])
     x_hat = x_true + INIT_FOLLOWER_OFFSET
-    err, sig, walls = [], [], []
+
+    if stream:
+        leader = viz.PoseReferenceFrame("/sim/leader")
+        leader_tr = viz.PositionTrace("/sim/leader", max_length=STEPS)
+        ftrue = viz.PoseReferenceFrame("/sim/follower_true")
+        ftrue_tr = viz.PositionTrace("/sim/follower_true", max_length=STEPS)
+        fest = viz.PoseReferenceFrame("/sim/follower_est")
+
+    rec = {
+        k: []
+        for k in (
+            "lead",
+            "ftrue",
+            "fest",
+            "Pf",
+            "err",
+            "sig",
+            "mineig",
+            "dist",
+            "walls",
+        )
+    }
     prev_u = None
-    for _ in range(STEPS):
+    t = 0.0
+    for i in tqdm.trange(STEPS):
         if use_oac:
             guess = np.tile(np.r_[LEADER_U, 1.0, 0.0], (WINDOW, 1))
             if prev_u is not None:
                 guess[:, 2:4] = np.vstack([prev_u[1:, 2:4], prev_u[-1:, 2:4]])
-            t = time.perf_counter()
             res = ctrl.solve(x_hat, guess)  # controller acts on the ESTIMATE
-            walls.append((time.perf_counter() - t) * 1e3)
             prev_u = res.u
             u_foll = res.u[0, 2:4]
+            rec["walls"].append(res.wall_time * 1e3)
+            rec["mineig"].append(_acc_min_eig(gram, x_hat, res.u))
         else:
             u_foll = np.array([1.0, 0.0])  # drive straight (no observability seeking)
         u = np.r_[LEADER_U, u_foll]
@@ -108,24 +166,126 @@ def run(use_oac, ctrl):
         )
         x_hat, P = ekf.update(jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(y))
         x_hat, P = np.array(x_hat), np.array(P)
-        err.append(float(np.linalg.norm(x_hat[3:5] - x_true[3:5])))
-        sig.append(float(3 * np.sqrt(max(np.trace(P[3:5, 3:5]) / 2, 0))))
-    err = np.array(err)
-    return {
-        "err": err,
-        "sig": np.array(sig),
-        "rmse": float(np.sqrt((err**2).mean())),
-        "final": float(err[-1]),
-        "walls": walls,
+
+        err = float(np.linalg.norm(x_hat[3:5] - x_true[3:5]))
+        # 3-sigma envelope for the position-error NORM = semi-major axis of the 3-sigma
+        # covariance ellipse (largest eigenvalue), matching the ellipse drawn by cov_ellipse.
+        sig = float(3 * np.sqrt(max(np.linalg.eigvalsh(P[3:5, 3:5])[-1], 0.0)))
+        dist = float(np.linalg.norm(x_true[0:2] - x_true[3:5]))
+        rec["lead"].append(x_true[0:2].copy())
+        rec["ftrue"].append(x_true[3:5].copy())
+        rec["fest"].append(x_hat[3:5].copy())
+        rec["Pf"].append(P[3:5, 3:5].copy())
+        rec["err"].append(err)
+        rec["sig"].append(sig)
+        rec["dist"].append(dist)
+        t += DT
+
+        if stream:
+            rr.set_time("/time", duration=t)
+            leader.set_pose(np.append(x_true[0:2], 0.0), PureYaw(angle=x_true[2]))
+            leader_tr.add_position(np.append(x_true[0:2], 0.0))
+            ftrue.set_pose(np.append(x_true[3:5], 0.0), PureYaw(angle=x_true[5]))
+            ftrue_tr.add_position(np.append(x_true[3:5], 0.0))
+            fest.set_pose(np.append(x_hat[3:5], 0.0), PureYaw(angle=x_hat[5]))
+            rr.log(
+                "/sim/follower_est/cov3sigma",
+                rr.LineStrips3D(
+                    cov_ellipse(x_hat[3:5], P[3:5, 3:5])[None], colors=[230, 160, 40]
+                ),
+            )
+            rr.log(
+                "/sim/range",
+                rr.LineStrips3D(
+                    np.array([
+                        np.append(x_true[0:2], 0.0),
+                        np.append(x_true[3:5], 0.0),
+                    ])[None],
+                    colors=[120, 120, 120],
+                ),
+            )
+            rr.log("/graphs/error/oac", rr.Scalars(err))
+            rr.log("/graphs/error/three_sigma", rr.Scalars(sig))
+            if noac_err is not None:
+                rr.log("/graphs/error/noac", rr.Scalars(float(noac_err[i])))
+            rr.log("/graphs/observability/min_eig", rr.Scalars(rec["mineig"][-1]))
+            rr.log("/graphs/solve/ms", rr.Scalars(rec["walls"][-1]))
+            rr.log("/graphs/distance/dist", rr.Scalars(dist))
+            rr.log("/graphs/distance/min", rr.Scalars(DIST_BOUNDS[0]))
+            rr.log("/graphs/distance/max", rr.Scalars(DIST_BOUNDS[1]))
+
+    out = {k: np.array(v) for k, v in rec.items() if v}
+    out["rmse"] = float(np.sqrt((out["err"] ** 2).mean()))
+    out["final"] = float(out["err"][-1])
+    return out
+
+
+def style_series():
+    spec = {
+        "/graphs/error/oac": ("OAC error [m]", [230, 40, 40]),
+        "/graphs/error/noac": ("no-OAC error [m]", [150, 150, 150]),
+        "/graphs/error/three_sigma": ("OAC 3-sigma [m]", [230, 160, 40]),
+        "/graphs/observability/min_eig": ("accumulated min-eig", [40, 120, 230]),
+        "/graphs/solve/ms": ("solve time [ms]", [40, 180, 80]),
+        "/graphs/distance/dist": ("inter-robot distance [m]", [180, 80, 220]),
+        "/graphs/distance/min": ("min bound", [150, 150, 150]),
+        "/graphs/distance/max": ("max bound", [150, 150, 150]),
     }
+    for path, (name, color) in spec.items():
+        rr.log(path, rr.SeriesLines(names=name, colors=color, widths=2), static=True)
+
+
+def send_blueprint():
+    rr.send_blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(origin="/sim", name="Leader-follower under OAC"),
+            rrb.Vertical(
+                rrb.TimeSeriesView(
+                    origin="/graphs/error", name="Follower-position error & 3-sigma"
+                ),
+                rrb.TimeSeriesView(
+                    origin="/graphs/observability", name="Accumulated observability"
+                ),
+                rrb.TimeSeriesView(origin="/graphs/solve", name="Solve time [ms]"),
+                rrb.TimeSeriesView(
+                    origin="/graphs/distance", name="Inter-robot distance [m]"
+                ),
+                row_shares=[1, 1, 1, 1],
+            ),
+            column_shares=[1.4, 1.0],
+        )
+    )
 
 
 def main():
-    ctrl = build_controller()
-    oac = run(True, ctrl)
-    noac = run(False, ctrl)
-    tt = np.arange(STEPS) * DT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--spawn", action="store_true", help="launch the live rerun viewer")
+    ap.add_argument("--save", type=str, default=None, help="record to this .rrd path")
+    args = ap.parse_args()
 
+    ctrl, cost = build_controller()
+    gram = jax.jit(
+        lambda x, u: cost(x, jnp.asarray(u), STLOG_DT, return_gramians=True).gramians
+    )
+
+    rr.init("rt_oac_planar", spawn=args.spawn)
+    rrd = args.save or str(RESULTS / "example_planar.rrd")
+    if not args.spawn:
+        rr.save(rrd)
+    style_series()
+    send_blueprint()
+
+    # no-OAC first (cheap, no solve) so its error can be overlaid on the live OAC run
+    noac = run(False, ctrl, gram, stream=False)
+    oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"])
+
+    summarize_and_plot(oac, noac)
+    if not args.spawn:
+        print(f"rerun recording written; open with:  rerun {rrd}")
+
+
+def summarize_and_plot(oac, noac):
+    tt = np.arange(STEPS) * DT
     print("=== RT-OAC planar cooperative navigation (frontier OPC + carried EKF) ===")
     print("follower-position estimation error  |   no-OAC   |    OAC")
     print(
@@ -139,25 +299,122 @@ def main():
     )
     print("=> OAC drives the unobservable initial error down; no-OAC cannot.")
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
-    a1.plot(tt, noac["err"], color="tab:gray", lw=2, label="no-OAC error")
-    a1.plot(tt, oac["err"], color="tab:red", lw=2, label="OAC error")
-    a1.plot(
-        tt, oac["sig"], color="tab:red", lw=1, ls="--", alpha=0.6, label="OAC 3-sigma"
-    )
-    a1.set(title="Follower-position estimation error", xlabel="t [s]", ylabel="m")
-    a1.grid(alpha=0.3)
-    a1.legend(fontsize=8)
-    a2.bar(
-        ["no-OAC", "OAC"], [noac["rmse"], oac["rmse"]], color=["tab:gray", "tab:red"]
-    )
-    a2.set(title="follower-position RMSE [m]", ylabel="m")
-    a2.grid(alpha=0.3, axis="y")
+    fig = plt.figure(figsize=(16, 9))
     fig.suptitle(
-        "RT-OAC planar: log-det + SLSQP@6 + carried EKF (OAC vs no-OAC)", fontsize=12
+        "RT-OAC planar cooperative navigation: log-det + SLSQP@6 + carried EKF "
+        "(OAC vs no-OAC)",
+        fontsize=14,
     )
-    fig.tight_layout()
-    out = pathlib.Path(__file__).resolve().parents[1] / "results" / "example_planar.png"
+
+    # (1) XY trajectories with periodic 3-sigma ellipses
+    ax = fig.add_subplot(2, 3, 1)
+    ax.plot(noac["lead"][:, 0], noac["lead"][:, 1], color="black", lw=2, label="leader")
+    ax.plot(
+        oac["ftrue"][:, 0],
+        oac["ftrue"][:, 1],
+        color="tab:red",
+        lw=1.6,
+        label="follower true (OAC)",
+    )
+    ax.plot(
+        oac["fest"][:, 0],
+        oac["fest"][:, 1],
+        color="tab:orange",
+        lw=1.2,
+        ls="--",
+        label="follower est (OAC)",
+    )
+    ax.plot(
+        noac["ftrue"][:, 0],
+        noac["ftrue"][:, 1],
+        color="tab:gray",
+        lw=1.4,
+        ls=":",
+        label="follower true (no-OAC)",
+    )
+    for k in range(0, STEPS, max(1, STEPS // 8)):
+        ell = cov_ellipse(oac["fest"][k], oac["Pf"][k])
+        ax.plot(ell[:, 0], ell[:, 1], color="tab:orange", lw=0.7, alpha=0.5)
+    ax.set(title="Trajectories (XY)", xlabel="x [m]", ylabel="y [m]")
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7, loc="best")
+
+    # (2) follower-position error OAC vs no-OAC
+    ax = fig.add_subplot(2, 3, 2)
+    ax.plot(tt, noac["err"], color="tab:gray", lw=2, label="no-OAC error")
+    ax.plot(tt, oac["err"], color="tab:red", lw=2, label="OAC error")
+    ax.plot(
+        tt,
+        oac["sig"],
+        color="tab:orange",
+        lw=1,
+        ls="--",
+        alpha=0.7,
+        label="OAC 3-sigma",
+    )
+    ax.set(title="Follower-position estimation error", xlabel="t [s]", ylabel="m")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # (3) RMSE / final-error bars
+    ax = fig.add_subplot(2, 3, 3)
+    xb = np.arange(2)
+    ax.bar(
+        xb - 0.18,
+        [noac["rmse"], oac["rmse"]],
+        0.36,
+        color=["tab:gray", "tab:red"],
+        label="RMSE",
+    )
+    ax.bar(
+        xb + 0.18,
+        [noac["final"], oac["final"]],
+        0.36,
+        color=["0.7", "tab:orange"],
+        label="final",
+    )
+    ax.set_xticks(xb, ["no-OAC", "OAC"])
+    ax.set(title="Estimation error summary", ylabel="m")
+    ax.grid(alpha=0.3, axis="y")
+    ax.legend(fontsize=8)
+
+    # (4) accumulated observability (min-eig)
+    ax = fig.add_subplot(2, 3, 4)
+    ax.plot(tt, oac["mineig"], color="tab:blue", lw=1.5)
+    ax.set(
+        title="Accumulated Gramian min-eigenvalue (OAC)",
+        xlabel="t [s]",
+        ylabel="$\\lambda_{min}$",
+    )
+    ax.grid(alpha=0.3)
+
+    # (5) solve time (drop tick-0 compile so the steady-state ms is legible)
+    ax = fig.add_subplot(2, 3, 5)
+    med = np.median(oac["walls"][1:])
+    ax.plot(tt[1:], oac["walls"][1:], color="tab:green", lw=1.2)
+    ax.axhline(med, color="0.5", ls=":", lw=1, label=f"median {med:.1f} ms")
+    ax.set(
+        title=f"Per-tick solve time (OAC), tick-0 compile {oac['walls'][0]:.0f} ms",
+        xlabel="t [s]",
+        ylabel="ms",
+        ylim=(0, max(np.percentile(oac["walls"][1:], 99) * 1.4, med * 3)),
+    )
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # (6) inter-robot distance vs bounds
+    ax = fig.add_subplot(2, 3, 6)
+    ax.plot(tt, oac["dist"], color="tab:purple", lw=1.5, label="OAC")
+    ax.plot(tt, noac["dist"], color="tab:gray", lw=1.2, ls=":", label="no-OAC")
+    ax.axhline(DIST_BOUNDS[0], color="0.5", ls="--", lw=1)
+    ax.axhline(DIST_BOUNDS[1], color="0.5", ls="--", lw=1, label="bounds")
+    ax.set(title="Inter-robot distance", xlabel="t [s]", ylabel="m")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out = RESULTS / "example_planar.png"
     fig.savefig(out, dpi=130)
     print(f"wrote {out}")
 

@@ -9,8 +9,13 @@ the real-time method, smarter estimation, experiments, and findings.
 
 **Two headline examples** mirror the companion's two, on the frontier method:
 `examples/quadrotor_cooperative_navigation.py` and
-`examples/simple_robot_cooperative_navigation.py`. Status & findings: **`PROGRESS.md`**
-(+ `results/RESULTS.md`, `results/phase0_findings.md`, `results/report.tex`).
+`examples/simple_robot_cooperative_navigation.py`. Both stream a live **rerun**
+visualization (3D/2D scene + trajectories + per-tick observability, plan-time, and
+inter-vehicle-distance time-series) and render a comprehensive multi-panel matplotlib
+figure afterwards. Run with `--spawn` for the live viewer, or headless (default) to write a
+`.rrd` recording (open later with `rerun results/example_*.rrd`) plus `results/example_*.png`.
+Status & findings: **`PROGRESS.md`** (+ `results/RESULTS.md`, `results/phase0_findings.md`,
+`results/report.tex`).
 
 Today the companion's Observability-Predictive Controller (OPC) runs only as an *offline*
 trajectory generator in flight experiments because of its computational cost.

@@ -24,7 +24,10 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
 - `src/rt_oac/error_state_ekf.py` — manifold-aware error-state EKF (9×9 tangent covariance,
   `boxplus`/`Log` residuals) — fixes the quaternion divergence.
 - `src/rt_oac/scenario.py` — single source of truth for the quadrotor problem + controller factory.
-- `benchmarks/` — profiling/diagnostics (the gate, old-vs-new, method×problem matrix).
+- `examples/` — the two rerun-instrumented headline examples (§6): quadrotor (soft-min orbit +
+  level-cruise leader, perfect feedback) and planar (OAC vs no-OAC with a carried EKF).
+- `benchmarks/` — profiling/diagnostics (the gate, old-vs-new, method×problem matrix) plus the
+  orbit band/objective sweep, the objective solver-profile + eval microbench, and the leader-speed sweep.
 - `experiments/` — closed-loop rollouts, planar EKF eval, drone EKF eval, orbit exploration.
 
 ## 3. Key findings
@@ -74,7 +77,32 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
 - **JAX-native solver / learned warm-start** — push under 100 ms with margin / reach 50 Hz.
 - **Sim-to-real ladder** — PX4 SITL → HIL on Jetson → flight (controller fixed, swap plant/sensors).
 
-## 6. Repository strategy (recommendation)
+## 6. Headline examples & live visualization
+The two headline examples are now the canonical demo — the standalone `experiments/headline_sim.py`
+was **retired** in favor of them. Both stream a live **rerun** scene (3D/2D trajectories, body
+frames, covariance ellipse, range) plus per-tick time-series (observability, plan time, distance,
+estimation error) and render a comprehensive multi-panel matplotlib figure afterwards. Run
+`--spawn` for the live viewer or headless (default) for a `.rrd` + `.png`.
+
+Three tuning nuances, each backed by a benchmark:
+- **Quadrotor objective/band → soft-min `[1, 2] m`** (`benchmarks/quad_constraint_sweep.py`).
+  Log-det (D-optimality) maximizes information *volume* and fills a 3D shell; **soft-min
+  (E-optimality)** fixes the *worst* direction and settles into a clean planar orbit. A narrow band
+  bracketing the start radius makes the motion a constant-radius ring rather than a
+  baseline-maximizing arc. (The planar example keeps log-det.)
+- **Soft-min is ~18% faster than log-det — but not because it is cheaper to evaluate.** Identical
+  iteration/eval counts (nit 6, nfev 7) and identical value+grad cost (3.44 vs 3.48 ms/call,
+  `benchmarks/objective_eval_microbench.py`). The gap is **constraint activity**
+  (`benchmarks/objective_solver_profile.py`): log-det pins the follower to the max-distance bound
+  (active inequality → costlier SLSQP QP each iteration), while soft-min orbits the band interior
+  (constraints slack). Log-det with the tight `[1, 2]` band actually *diverges*.
+- **Leader speed is free** (`benchmarks/leader_speed_sweep.py`). The paper's leader is a min-snap
+  10 m / 120 s hop (~0.16 m/s) — only ~0.16 m over the 15 s window, visually frozen. The relative
+  dynamics are **Galilean-invariant**, so a level constant-velocity leader at 1/2/3 m/s gives an
+  *identical* relative orbit, observability, and solve time, only stretching the world-frame scene
+  into a helix. The example uses a level **2 m/s** cruise (~30 m / 15 s).
+
+## 7. Repository strategy (recommendation)
 **Promote this repo as the canonical "future work on OAC" repo** (two headline examples
 mirroring the companion's two: quadrotor + planar, on the frontier method). Keep the companion
 repo pristine/reproducible for the paper. **Selectively upstream** only the small, additive,
