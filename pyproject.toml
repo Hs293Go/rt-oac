@@ -98,6 +98,12 @@ per-file-ignores = { "tests/**" = [
   "D", "S101", "T20", "SLF001", "N806", "N803", "B023", "PLC0415", "PLW0108", "RUF001", "E501", "ARG",
 ], "examples/**" = [
   "D", "S101", "T20", "SLF001", "N806", "N803", "B023", "PLC0415", "PLW0108", "RUF001", "E501", "ARG",
+], "src/rt_oac/balanced_cost.py" = [
+  # Combiner strategy pattern: the trade-off rule is documented at the class level and
+  # every combiner shares the uniform (j_track, j_obs, weight) signature, so the unused
+  # args in ObservabilityOnly/TrackingOnly and the trivial delegation methods are
+  # intentional.
+  "D102", "ARG002",
 ], "src/rt_oac/error_state_ekf.py" = [
   # Dense Kalman-filter linear algebra: keep the canonical math-convention matrix
   # symbols (covariance P, transition F, input map G, measurement H, innovation cov S,

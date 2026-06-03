@@ -84,6 +84,14 @@ class RTController:
         # jit once; (free, u_const, x0) are runtime args -> no per-step recompile
         self._obj_jit = jax.jit(self._objective)
         self._vag_jit = jax.jit(jax.value_and_grad(self._objective))
+        # Balanced costs (rt_oac.balanced_cost) expose .evaluate(x0, us, dt, p_ref, w).
+        # Thread p_ref/weight as runtime args so a moving reference or a scheduled
+        # weight varies per step without recompiling (Stage B dual control).
+        self._vag_threaded = (
+            jax.jit(jax.value_and_grad(self._objective_threaded))
+            if hasattr(cost, "evaluate")
+            else None
+        )
         if constraint is not None:
             self._con_jit = jax.jit(self._constraint_value)
             self._conjac_jit = jax.jit(jax.jacobian(self._constraint_value))
@@ -98,6 +106,10 @@ class RTController:
     def _objective(self, free, u_const, x0):
         return self._cost(x0, self._recombine(free, u_const), self._dt).objective
 
+    def _objective_threaded(self, free, u_const, x0, p_ref, weight):
+        u = self._recombine(free, u_const)
+        return self._cost.evaluate(x0, u, self._dt, p_ref, weight).objective
+
     def _constraint_value(self, free, u_const, x0):
         u = self._recombine(free, u_const)
         if "cost" in inspect.signature(self._constraint).parameters:
@@ -105,11 +117,23 @@ class RTController:
         return self._constraint(x0, u)
 
     # ---- solve --------------------------------------------------------------------
-    def solve(self, x0: ArrayLike, u_guess: ArrayLike) -> SolveResult:
+    def solve(
+        self,
+        x0: ArrayLike,
+        u_guess: ArrayLike,
+        *,
+        p_ref: ArrayLike | None = None,
+        weight: ArrayLike = 1.0,
+    ) -> SolveResult:
         """Solve the OAC problem for operating state ``x0`` seeded with ``u_guess``.
 
         ``u_guess`` is ``(window, n_inputs)``: its leader columns are held constant, its
         follower columns are the decision-variable initial guess (warm-start friendly).
+
+        When the cost is a balanced cost (``rt_oac.balanced_cost``), pass ``p_ref`` (the
+        per-window position reference) and ``weight`` (the observability trade-off,
+        maybe covariance-scheduled). Both are threaded as runtime args, so the objective
+        compiles once and the reference/weight vary per step.
         """
         x0 = jnp.asarray(x0)
         u_guess = jnp.asarray(u_guess)
@@ -120,9 +144,25 @@ class RTController:
         lb = np.broadcast_to(self._lb, (window, self._follower.shape[0])).ravel()
         ub = np.broadcast_to(self._ub, (window, self._follower.shape[0])).ravel()
 
-        def fun_and_jac(free):
-            val, grad = self._vag_jit(jnp.asarray(free), u_const, x0)
-            return float(val), np.asarray(grad)
+        if p_ref is not None:
+            if self._vag_threaded is None:
+                raise ValueError(
+                    "p_ref given but the cost has no .evaluate (not balanced)"
+                )
+            p_ref_j = jnp.asarray(p_ref)
+            weight_j = jnp.asarray(weight, dtype=jnp.float64)
+
+            def fun_and_jac(free):
+                val, grad = self._vag_threaded(
+                    jnp.asarray(free), u_const, x0, p_ref_j, weight_j
+                )
+                return float(val), np.asarray(grad)
+
+        else:
+
+            def fun_and_jac(free):
+                val, grad = self._vag_jit(jnp.asarray(free), u_const, x0)
+                return float(val), np.asarray(grad)
 
         cache: dict[str, Any] = {}
 
