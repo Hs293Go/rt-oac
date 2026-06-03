@@ -24,11 +24,16 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
 - `src/rt_oac/error_state_ekf.py` — manifold-aware error-state EKF (9×9 tangent covariance,
   `boxplus`/`Log` residuals) — fixes the quaternion divergence.
 - `src/rt_oac/scenario.py` — single source of truth for the quadrotor problem + controller factory.
+- `src/rt_oac/{tracking_cost,balanced_cost,balance_constraints,dual_control}.py` — the
+  balanced-cost machinery for the coupling exercise (§7): standoff/tracking term, combiners,
+  soft tube, covariance-scheduled weight.
 - `examples/` — the two rerun-instrumented headline examples (§6): quadrotor (soft-min orbit +
   level-cruise leader, perfect feedback) and planar (OAC vs no-OAC with a carried EKF).
 - `benchmarks/` — profiling/diagnostics (the gate, old-vs-new, method×problem matrix) plus the
-  orbit band/objective sweep, the objective solver-profile + eval microbench, and the leader-speed sweep.
-- `experiments/` — closed-loop rollouts, planar EKF eval, drone EKF eval, orbit exploration.
+  orbit band/objective sweep, the objective solver-profile + eval microbench, the leader-speed
+  sweep, the coupling Pareto sweep, and the penalty-vs-hard-constraint solver probe.
+- `experiments/` — closed-loop rollouts, planar/drone EKF eval, orbit exploration, and the
+  control/estimation-coupling evals (`planar_coupling_eval.py`, `drone_coupling_eval.py`).
 
 ## 3. Key findings
 1. **Bottleneck is the optimizer, not the STLOG.** Per solve: ~6% in observability compute,
@@ -58,6 +63,18 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
    estimate → fundamental, not transient). The observability-greedy objective destabilizes the
    very estimator it relies on. The **gentle** config (ESEKF + [1,3] m + log-det) is the stable
    realistic closed loop.
+9. **Coupling resolved by a standoff anchor (+ dual control)** — see §7. Mechanically reusing
+   the tracking worktree's balanced-cost machinery (ported to `src/rt_oac/{tracking_cost,
+   balanced_cost,balance_constraints,dual_control}.py`), a Euclidean standoff anchor competes
+   with observability. On the quadrotor #8 testbed (soft-min + tight band, 80 steps) pure
+   observability destabilizes the ESEKF (NEES ~260, distance escapes the band to ~6.5 m); a
+   **velocity-damped** standoff (relative position → standoff AND relative velocity → 0) restores
+   a bounded, consistent loop (normalized: error 0.46 m, **NEES 14.3 in the χ² 95% band [2.7, 19]**,
+   distance 1.60 m), and the **covariance-scheduled** weight keeps NEES lowest (11.8). A
+   *position-only* anchor cannot arrest the relative-velocity drift and still diverges — velocity
+   damping is essential. **Partial, not permanent:** over longer horizons a slow residual drift
+   develops (by ~120 steps the error/NEES roughly double), so this is a bounded, near-consistent
+   loop at the validated horizon, not a proven fixed point — full long-horizon stability is open.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
@@ -68,13 +85,20 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
   objective; quadrotor estimation not yet validated to flight grade).
 
 ## 5. Open / future work
-- **Hybrid tracking + observability objective** — required: pure observability orbits/wanders and
-  destabilizes the estimate-feedback loop (finding #8).
-- **Dual / uncertainty-aware control** — plan on the covariance so maneuvers don't outrun the
-  estimator (the coupling instability).
+- **Hybrid tracking + observability objective** — *addressed* (§7, finding #9): a velocity-damped
+  standoff anchor balanced with observability resolves the finding-#8 divergence.
+- **Dual / uncertainty-aware control** — *partly addressed* (§7): a covariance→weight schedule
+  helps; the remaining step is true belief-space planning (plan on the full covariance) and full
+  NEES consistency in the most aggressive regime.
 - **Quadrotor estimation to flight grade** — validate ESEKF on the real target; 2 followers,
   full 120 s, world-frame trajectories.
 - **JAX-native solver / learned warm-start** — push under 100 ms with margin / reach 50 Hz.
+  *De-risked* (`benchmarks/penalty_solver_probe.py`): baking the distance band into the cost as a
+  smooth one-sided penalty and dropping to a box-bounded **unconstrained L-BFGS-B** solve is
+  **~1.6–4.0× faster** than the hard-constrained SLSQP (penalty 32 ms at w=1, 52 ms at w=10, 80 ms
+  at w=100 vs 128 ms hard) with **zero band violation** — at a modest observability cost (the
+  penalty keeps the follower off the bound that log-det rides; higher w is tighter/feasibler but
+  slower). No active-set machinery → fully JIT-able, the foundation for a JAX-native solver.
 - **Sim-to-real ladder** — PX4 SITL → HIL on Jetson → flight (controller fixed, swap plant/sensors).
 
 ## 6. Headline examples & live visualization
@@ -83,6 +107,15 @@ was **retired** in favor of them. Both stream a live **rerun** scene (3D/2D traj
 frames, covariance ellipse, range) plus per-tick time-series (observability, plan time, distance,
 estimation error) and render a comprehensive multi-panel matplotlib figure afterwards. Run
 `--spawn` for the live viewer or headless (default) for a `.rrd` + `.png`.
+
+A `--hybrid` toggle activates the tracking/observability hybridization (the §7 golden form —
+NormalizedWeightedSum with a velocity-damped standoff anchor) **and the closed-loop estimator**:
+the quadrotor switches from the open-loop soft-min orbit to the ESEKF estimate-feedback loop
+that resolves #8 (bounded, estimator near-consistent — NEES in the χ² band at ~80 steps, ~22 just
+above it by 120 as the slow drift sets in); the planar swaps its log-det OAC for the balanced
+cost. The hybrid quadrotor runs against the as-validated (default) leader — the
+level-cruise override is open-loop only, since under estimate feedback a fast leader destabilizes
+the standoff-tracking loop.
 
 Three tuning nuances, each backed by a benchmark:
 - **Quadrotor objective/band → soft-min `[1, 2] m`** (`benchmarks/quad_constraint_sweep.py`).
@@ -102,7 +135,32 @@ Three tuning nuances, each backed by a benchmark:
   *identical* relative orbit, observability, and solve time, only stretching the world-frame scene
   into a helix. The example uses a level **2 m/s** cruise (~30 m / 15 s).
 
-## 7. Repository strategy (recommendation)
+## 7. Resolving the control/estimation coupling (balanced + dual-control OAC)
+The exercise that addresses finding #8, *mechanically the same* as balancing tracking and
+observability. The tracking worktree's balanced-cost machinery is ported into rt-oac
+(`src/rt_oac/tracking_cost.py`, `balanced_cost.py`, `balance_constraints.py`,
+`dual_control.py`; `RTController.solve` now threads `p_ref`/`weight` as runtime args, compiled
+once). A standoff/formation **anchor** competes with observability via swappable combiners
+(`normalized` / `gradnorm` / soft `tube`; the min-eig `floor` is omitted — non-smooth/broken).
+The trade-off weight can be **covariance-scheduled**: spend the observability budget only where
+the estimator can keep up.
+
+- **Quadrotor (`experiments/drone_coupling_eval.py`, the #8 testbed; 80 steps):** soft-min + tight
+  band + estimate feedback. Pure observability destabilizes the ESEKF (NEES ~260, distance escapes
+  the band to ~6.5 m). A **velocity-damped** standoff (relative position → standoff *and* relative
+  velocity → 0) keeps the loop bounded and consistent (normalized: error 0.46 m, NEES 14.3 in the
+  χ² band, distance 1.60 m); the **scheduled** weight keeps NEES lowest (11.8). A position-only
+  anchor still diverges — damping the relative velocity is essential. The resolution is *partial*
+  (a slow residual drift develops over longer horizons), not a proven fixed point.
+- **Planar (`experiments/planar_coupling_eval.py`, fast dev):** observability is the *stabilizer*
+  (the follower must maneuver to localize), so the schedule is reversed (up-weight observability
+  when uncertain = active perception). The schemes trace a clean estimation-vs-formation Pareto
+  (`benchmarks/coupling_pareto_sweep.py`): normalized λ≈1 is the knee, `gradnorm` over-weights the
+  steep observability gradient and is dominated here.
+- **Open:** full NEES consistency in the most aggressive regime, and belief-space (covariance)
+  planning rather than a scalar covariance→weight schedule.
+
+## 8. Repository strategy (recommendation)
 **Promote this repo as the canonical "future work on OAC" repo** (two headline examples
 mirroring the companion's two: quadrotor + planar, on the frontier method). Keep the companion
 repo pristine/reproducible for the paper. **Selectively upstream** only the small, additive,
