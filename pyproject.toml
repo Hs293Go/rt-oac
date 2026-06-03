@@ -1,0 +1,115 @@
+[project]
+name = "rt_oac"
+version = "0.0.1"
+description = "Real-time observability-aware control: faster solution of the OAC problem"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+# Minimal, CPU-only dependency set. The verified STLOG / Lie-derivative / integrator
+# / model code is reused verbatim from the companion repo by placing its `src` on
+# PYTHONPATH (see env.sh / justfile / tests/conftest.py), NOT by installing it -- the
+# companion pyproject pulls jax[cuda12] + casadi + pyqt5 + rerun-sdk, none of which the
+# real-time (Jetson, CPU) target needs.
+dependencies = [
+  "jax>=0.7.1",
+  "equinox>=0.10.4",
+  "scipy>=1.13",
+  "numpy",
+  "matplotlib>=3.10",
+  "tqdm",
+  # real-time visualization for the headline sim (matches the companion repo's rerun
+  # version so its example_lib.visualization helpers and logging APIs line up exactly)
+  "rerun-sdk==0.24.1",
+  # The companion repo, as a local editable dependency (see [tool.uv.sources]). The
+  # editable install exposes BOTH its packages (observability_aware_control and
+  # example_lib), so they import without any sys.path/PYTHONPATH bootstrap.
+  "observability_aware_control",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rt_oac"]
+
+# Reuse the companion repo's verified source as a local editable dependency. uv builds it
+# in place, so edits to the companion are picked up live, and both of its packages
+# (observability_aware_control + example_lib) become importable normally.
+[tool.uv.sources]
+observability_aware_control = { path = "../observability_aware_control", editable = true }
+
+[tool.uv]
+# The companion's pyproject declares heavy deps the Jetson/CPU real-time target does not
+# need; none of the modules we import pull them. Drop the CUDA jax extra and exclude the
+# GUI / symbolic / trajectory-gen packages via always-false markers.
+override-dependencies = [
+  "jax>=0.7.1",
+  "casadi; sys_platform == 'never'",
+  "pyqt5; sys_platform == 'never'",
+  "minsnap-trajectories; sys_platform == 'never'",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = "ignore::DeprecationWarning"
+# the companion package is an installed (editable) dependency; only rt-oac's own src
+# needs to be on the path for tests
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = ["pytest>=8.4.1", "pre-commit"]
+
+# ---- ruff config copied from the companion repo for a consistent style ----
+[tool.ruff]
+target-version = "py312"
+preview = true
+fix = true
+unsafe-fixes = true
+extend-exclude = [".venv", "venv", "build", "dist"]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W", "B", "I", "N", "D", "UP", "S", "SIM", "C4", "PTH", "PIE",
+  "PERF", "ISC", "ICN", "ARG", "YTT", "SLF", "TRY", "EXE", "PL", "RUF",
+]
+ignore = [
+  "COM", "E111", "E114", "E117", "W191",
+  "D203", "D213", "D401", "ANN", "C90", "T20", "ERA", "TRY003",
+  "PLR2004", "PLR0904", "PLR0911", "PLR0912", "PLR0913", "PLR0914",
+  "PLR0915", "PLR0916", "PLR0917",
+]
+fixable = ["ALL"]
+unfixable = ["S", "PL"]
+# benchmarks/ and experiments/ are research / analysis scripts (like tests): they reach into
+# private members for profiling, use math-convention names (P, X0), build throwaway lambdas in
+# loops, lazily import heavy viz deps, and carry prose-heavy docstrings. Relax the
+# library-grade rules there; src/ stays strict.
+per-file-ignores = { "tests/**" = [
+  "D", "ANN", "S101", "T20", "SLF001",
+], "benchmarks/**" = [
+  "D", "S101", "T20", "SLF001", "N806", "N803", "B023", "PLC0415", "PLW0108", "RUF001", "E501", "ARG",
+], "experiments/**" = [
+  "D", "S101", "T20", "SLF001", "N806", "N803", "B023", "PLC0415", "PLW0108", "RUF001", "E501", "ARG",
+], "examples/**" = [
+  "D", "S101", "T20", "SLF001", "N806", "N803", "B023", "PLC0415", "PLW0108", "RUF001", "E501", "ARG",
+], "src/rt_oac/error_state_ekf.py" = [
+  # Dense Kalman-filter linear algebra: keep the canonical math-convention matrix
+  # symbols (covariance P, transition F, input map G, measurement H, innovation cov S,
+  # gain K) rather than lowercasing them, which would obscure the standard EKF equations.
+  "N803", "N806",
+], "**/__init__.py" = [
+  "F401", "F403", "D104",
+] }
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"

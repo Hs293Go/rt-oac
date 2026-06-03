@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# JAX / XLA persistent compilation cache
+.cache/
+
+# Results: keep summary CSV/markdown + report.{tex,md,pdf}, ignore bulky raw artifacts
+results/**/*.npz
+results/**/*.png
+results/**/*.gif
+results/**/*.rrd
+results/**/*.pkl
+results/**/*.eqx
+!results/**/.gitkeep
+
+# LaTeX build intermediates (results/report.tex builds in place)
+results/**/*.aux
+results/**/*.fdb_latexmk
+results/**/*.fls
+results/**/*.log
+results/**/*.out
+
+# Editor
+.vscode/
+.idea/

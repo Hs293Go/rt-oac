@@ -1,0 +1,293 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\stlog}{\mathbf{W}^{(r)}}
+\newcommand{\xs}{\mathbf{x}}
+\newcommand{\us}{\mathbf{u}}
+\newcommand{\ys}{\mathbf{y}}
+
+\title{Toward Real-Time Observability-Aware Control:\\
+A Diagnostic Study and a Reformulated Objective}
+\author{H.~S.~Helson Go}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study the open problem of solving the observability-aware control (OAC) problem fast
+enough for real-time, receding-horizon execution, which the parent work currently performs
+only offline. Through systematic profiling we establish that, contrary to the prevailing
+assumption, the computational bottleneck is \emph{not} the evaluation of the Short-Time
+Local Observability Gramian (STLOG): the entire observability computation accounts for
+${\sim}6\%$ of solve time, while the general-purpose nonlinear solver accounts for
+${\sim}94\%$. We further find that the objective used in the parent work---the sum over the
+horizon of the minimum eigenvalue of the per-node Gramian---is \emph{numerically degenerate}:
+its value is floored by the short-time scaling $\lambda_{\min}\sim T^{2r_*+1}$, and its
+gradient is effectively zero, so no gradient-based solver can make progress. Replacing it
+with a smooth log-determinant surrogate restores a strong gradient and drives trajectories to
+full observability. Combined with a lightweight solver (SLSQP) and early termination, the
+per-solve wall time on the range-only quadrotor problem drops from ${\sim}10$\,s to
+${\sim}100$\,ms (a $10$\,Hz guidance rate) while maintaining full observability. A
+closed-loop Extended Kalman Filter (EKF) evaluation on a planar leader--follower analogue
+confirms that the fast, early-terminated controller reduces follower-position estimation
+error by ${\sim}13\times$ (final) and posterior covariance by ${\sim}20\times$ relative to a
+non-OAC baseline, and that early termination preserves the full estimation benefit. The
+controller reproduces the theoretically expected observability-optimal \emph{orbiting}
+behavior.
+\end{abstract}
+
+\paragraph{Reproducibility.} All measurements were taken on a 16-core CPU host
+(\texttt{JAX\_PLATFORMS=cpu}, float64), reusing the verified STLOG, Lie-derivative,
+integrator, and model implementations from the \texttt{observability\_aware\_control}
+companion repository. Raw data and scripts are in \texttt{benchmarks/}, \texttt{experiments/},
+and \texttt{results/} of the \texttt{rt-oac} repository.
+
+\section{Problem statement}
+
+The parent work designs control inputs that improve the observability of a leader--follower
+quadrotor cooperative-localization system from range and relative-attitude measurements. The
+relative state is
+\[
+\xs = [\,\mathbf{r}^\top,\ \mathbf{q}^\top,\ \mathbf{v}^\top\,]^\top \in \mathbb{R}^{10},
+\qquad \mathbf{r}\in\mathbb{R}^3,\ \mathbf{q}\in\mathcal{S}^3,\ \mathbf{v}\in\mathbb{R}^3,
+\]
+with input $\us\in\mathbb{R}^8$ (leader and follower thrust and body rates) and output
+\[
+\ys = \left[\,\tfrac{1}{2}d^2,\ \mathbf{q}^\top\,\right]^\top \in \mathbb{R}^5,
+\qquad d=\lVert\mathbf{r}\rVert .
+\]
+Observability over a short horizon $T$ is quantified by the $r$-th order STLOG
+\begin{equation}
+\stlog = \sum_{i,j=0}^{r}\frac{T^{\,i+j+1}}{(i+j+1)\,i!\,j!}
+\, D\!\left(L_\mathbf{f}^i \mathbf{h}\right)^{\!\top} \boldsymbol{\Sigma}^{-1}
+D\!\left(L_\mathbf{f}^j \mathbf{h}\right),
+\label{eq:stlog}
+\end{equation}
+evaluated at each node of a predicted trajectory. The observability-predictive controller
+(OPC) maximizes a metric of $\{\stlog_k\}_{k=0}^{N-1}$ over a receding horizon subject to
+input and inter-vehicle-distance constraints. With $r=5$, $T=0.2$\,s, and $N=20$ the OPC
+solve is too slow for online thrust/rate generation and is consequently used offline. The
+objective of this study is to identify what actually makes the solve slow and ineffective,
+and to make it real-time.
+
+\section{Method}
+
+We constructed a focused testbed (\texttt{rt-oac}) that imports the companion's verified
+numerics unchanged and adds: (i) a profiling harness that attributes solve time across
+components; (ii) a library of smooth surrogate objectives injected through the cost's existing
+\texttt{gramian\_metric} hook; (iii) a controller supporting a selectable solver,
+warm-starting, and early termination; and (iv) a closed-loop EKF evaluation. All timed
+quantities are JIT-compiled and synchronized with \texttt{block\_until\_ready}; reported wall
+times are steady-state (post-compilation). A persistent XLA cache amortizes the one-time
+${\sim}200$\,s compilation of the order-$5$ graph.
+
+\section{Results}
+
+\subsection{The optimizer, not the observability computation, is the bottleneck}
+
+Component micro-benchmarks (Table~\ref{tab:components}) show the observability machinery is
+cheap once compiled. A single STLOG evaluation costs $52\,\mu$s (versus ${\sim}441$\,ms
+\emph{un-compiled}---a ${\sim}6500\times$ penalty that explains the folklore that ``the STLOG
+is expensive''). A full objective evaluation over the $N=20$ horizon is $0.5$\,ms; its
+reverse-mode gradient $4$\,ms.
+
+\begin{table}[h]
+\centering
+\caption{Per-component cost (order $5$, $N=20$, JIT-compiled).}
+\label{tab:components}
+\begin{tabular}{lr}
+\toprule
+component & cost \\
+\midrule
+STLOG evaluation (one node) & $52\,\mu$s \\
+objective (rollout $+\ 20\times$ STLOG $+$ metric) & $0.5$\,ms \\
+gradient (reverse mode) & $4.0$\,ms \\
+distance constraint & $0.035$\,ms \\
+constraint Jacobian & $0.31$\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Attributing one full \texttt{trust-constr} solve ($40$ iterations) shows
+$0.68$\,s ($6\%$) inside the JAX callables and $10.6$\,s ($94\%$) inside the solver's own
+Python and linear-algebra internals. We verified there is no recompilation across solves and
+no measurable NumPy/JAX boundary penalty (the controller's methods cost the same on NumPy or
+JAX inputs). The implication is that accelerating the STLOG cannot materially help; the
+solver must change.
+
+\subsection{The minimum-eigenvalue objective is numerically degenerate}
+
+At the operating points of interest the per-node Gramian is numerically singular: the minimum
+eigenvalue of the sliced (position, velocity) $6\times6$ Gramian is ${\sim}10^{-13}$ across
+all horizon nodes, and the same holds for the full tangent-space $9\times9$ Gramian (with the
+quaternion gauge removed). Consequently the parent objective $\sum_k\lambda_{\min}(\stlog_k)$
+has an automatic-differentiation gradient norm of ${\sim}10^{-13}$, i.e.\ effectively zero.
+The cause is intrinsic: the worst-observed direction enters only through high-order Lie
+derivatives, whose STLOG weight in~\eqref{eq:stlog} scales as $T^{2r_*+1}=T^{11}$ at order
+$5$, i.e.\ ${\sim}2\times10^{-8}$---below the noise floor.
+
+This degeneracy, not solver speed alone, is why the solve is ineffective. Given a zero
+gradient, \texttt{trust-constr} exhausts its $40$-iteration budget without improving the
+objective, while \texttt{SLSQP} correctly detects the flat landscape and terminates in one
+iteration; both end at the worst objective value. This also reconciles an apparent
+${\sim}25\times$ ``regression'' ($0.4$\,s $\to 10$\,s): the slow case is the controller
+thrashing on the degenerate landscape of a \emph{manifestly unobservable configuration}
+(MUC)---here co-hovering / straight co-motion---which the parent thesis enumerates explicitly.
+The MUC is expected behavior, not a fault. (A separate latent defect was found in an
+in-progress manifold port: a $9\times9$ tangent Gramian sliced with ambient indices clamps an
+out-of-bounds index, fabricating a singular Gramian; this has been flagged for repair.)
+
+\subsection{A smooth surrogate restores the gradient and full observability}
+
+We replace the metric with a per-node negative log-determinant,
+\begin{equation}
+J = -\sum_k \sum_i \log\!\big(\lambda_i(\stlog_k)+\varepsilon\big).
+\label{eq:logdet}
+\end{equation}
+Because $\partial\log(\lambda+\varepsilon)/\partial\lambda=(\lambda+\varepsilon)^{-1}$ is
+\emph{largest} exactly where $\lambda\to0$, the log-determinant actively lifts the weak
+directions that the minimum-eigenvalue objective cannot. At a non-MUC configuration
+(tangential relative velocity, non-identity relative attitude), measuring observability by the
+number of well-conditioned directions of the \emph{accumulated} Gramian $\sum_k\stlog_k$
+(Table~\ref{tab:objectives}), the log-determinant converts a flat, intractable problem into
+one a lightweight solver drives to full observability.
+
+\begin{table}[h]
+\centering
+\caption{Objective comparison at a non-MUC configuration (SLSQP).}
+\label{tab:objectives}
+\begin{tabular}{lccc}
+\toprule
+objective & gradient norm & observable directions (of $6$) & accumulated $\lambda_{\min}$ \\
+\midrule
+minimum eigenvalue (parent) & ${\sim}10^{-15}$ & $4 \to 4$ (no change) & ${\sim}0$ \\
+\textbf{negative log-det} & $\mathbf{12\text{--}15}$ & $\mathbf{4 \to 6}$ \textbf{(full)} & $\mathbf{1.7\text{--}10.6}$ \\
+negative soft-min & $0.4$ & $4 \to 6$ & $2.4\text{--}3.9$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Real-time solve via a lightweight solver and early termination}
+
+Replacing \texttt{trust-constr} (${\approx}265$\,ms/iteration on this problem) with
+\texttt{SLSQP} (${\approx}18$\,ms/iteration), and observing that iterations beyond ${\sim}6$
+only refine eigenvalue magnitudes---not the set of observable directions---we early-terminate.
+In a true-state receding-horizon rollout of the order-$5$ quadrotor problem from a non-MUC
+state (Table~\ref{tab:realtime}), the $10$\,Hz guidance target ($\le 100$\,ms) is met while
+maintaining full observability: a ${\sim}100\times$ improvement over the original degenerate
+${\sim}10$\,s solve.
+
+\begin{table}[h]
+\centering
+\caption{Quadrotor closed-loop solve time versus iteration cap.}
+\label{tab:realtime}
+\begin{tabular}{lcc}
+\toprule
+iteration cap & median wall / solve & observable directions \\
+\midrule
+$80$ & $1.0\text{--}1.5$\,s & $6/6$ \\
+$12$ & $0.22$\,s & $6/6$ \\
+$\mathbf{6}$ & $\mathbf{0.10}$\,\textbf{s} & $\mathbf{6/6}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Closed-loop estimation accuracy (planar EKF)}
+
+To test the decisive question---whether the fast, early-terminated controller preserves
+\emph{estimation quality}, not merely a coarse observability count---we used a planar
+leader--follower analogue for which a quaternion-free EKF is available. The leader drives
+straight; the follower's position is observable only through the inter-vehicle range. We run a
+closed loop in which the EKF carries its own estimate (the controller sees only the estimate;
+ground truth evolves independently; error accumulates), with a large initial follower-position
+error ($2$\,m standard deviation), averaged over $8$ seeds (Table~\ref{tab:ekf}).
+
+\begin{table}[h]
+\centering
+\caption{Planar closed-loop EKF over $8$ seeds (follower-position error).}
+\label{tab:ekf}
+\begin{tabular}{lcccc}
+\toprule
+condition & RMSE (mean\,$\pm$\,std) & final error & terminal cov. & solve \\
+\midrule
+no-OAC (drive straight) & $1.53\pm0.87$ & $1.52$ & $1.5\times10^{-1}$ & --- \\
+OAC, full (cap $60$) & $0.64\pm0.59$ & $0.12$ & $7.6\times10^{-3}$ & $4$\,ms / $10$\,it \\
+\textbf{OAC, fast (cap $6$)} & $\mathbf{0.68\pm0.68}$ & $\mathbf{0.11}$ & $\mathbf{8.0\times10^{-3}}$ & $\mathbf{3}$\,\textbf{ms} / $\mathbf{6}$\,\textbf{it} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Without OAC the estimator cannot reduce the unobservable initial error (final $\approx$
+initial); with OAC the final error falls ${\sim}13\times$, RMSE ${\sim}2.4\times$, and
+posterior covariance ${\sim}20\times$. Crucially, the fast controller (cap $6$) matches the
+fully converged one on every metric---early termination is safe with respect to estimation
+accuracy.
+
+\subsection{Emergent observability-optimal behavior}
+
+The log-determinant controller reproduces the textbook observability-optimal maneuver
+(Figure~\ref{fig:traj}). In a planar rollout the follower sweeps a cumulative relative bearing
+of $-1613^\circ$ (${\approx}4.5$ revolutions) around the leader---it \emph{orbits}---pressing
+against the minimum allowed separation (distance bottoms at the $0.20$\,m bound) to maximize
+bearing rate and hence information, while the non-OAC follower sweeps $0^\circ$. This is
+consistent with the parent theory and with the known caveat that pure observability
+objectives, absent a tracking term, produce operationally awkward (orbiting) trajectories.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{planar_trajectory.png}
+\caption{Planar leader--follower trajectory under observability-aware control.
+\textit{Left:} world frame---the leader drives straight (black), the non-OAC follower drives
+straight and parallel (grey dashed), and the OAC follower traces cycloidal loops (colored by
+time). \textit{Right:} leader-relative frame---the OAC follower clearly circles the leader
+($\star$), confirming the orbiting behavior.}
+\label{fig:traj}
+\end{figure}
+
+\section{Discussion}
+
+The study reframes the path to real-time OAC. The dominant levers are, in order:
+(1)~\emph{objective reformulation}---the log-determinant restores a usable gradient that the
+parent minimum-eigenvalue objective lacks at the relevant operating regime;
+(2)~\emph{a lightweight solver}---most of the original solve time was general-purpose
+nonlinear-programming overhead, not problem-specific computation; and
+(3)~\emph{early termination}---the observability content of a solution saturates within a
+handful of iterations. STLOG acceleration and problem transcription, prominent in the initial
+plan, proved largely irrelevant because the observability computation is only ${\sim}6\%$ of
+the cost.
+
+\paragraph{Limitations.}
+(i)~The real-time quadrotor result is validated against an observable-direction count, a
+coarse proxy; the rigorous estimation-accuracy validation was performed on the planar
+analogue, not the quaternion quadrotor (an error-state EKF for the latter is future work).
+(ii)~Measurements are single-host and CPU-only.
+(iii)~The observable-direction count thresholds eigenvalues relative to the largest; absolute
+conditioning remains poor (the $T^{11}$ floor), which is precisely why the log-determinant
+rather than the minimum eigenvalue is the appropriate target.
+(iv)~Operating away from MUCs is assumed; escaping MUCs is out of scope.
+
+\section{Conclusion and future work}
+
+Real-time observability-aware control is achievable for the studied system: a smooth
+log-determinant objective, a lightweight early-terminated solver, and operation away from
+manifestly unobservable configurations reduce the solve from ${\sim}10$\,s to ${\sim}100$\,ms
+($10$\,Hz) while a closed-loop EKF confirms the fast controller retains the full estimation
+benefit (${\sim}13\times$ lower final error than no OAC). The headline finding is that the
+parent minimum-eigenvalue objective is numerically degenerate at the relevant regime and
+should be replaced by the log-determinant for any gradient-based real-time use.
+
+Future work: (1)~an error-state / manifold EKF to validate estimation accuracy on the
+quaternion quadrotor; (2)~a JAX-native solver to remove the residual ${\sim}13$\,ms/iteration
+of solver overhead (the gradient is only $4$\,ms) and target $\ge 50$\,Hz; (3)~a learned
+warm-start to approach single-iteration solves; and (4)~a hybrid tracking-plus-observability
+objective to temper the orbiting behavior.
+
+\end{document}
