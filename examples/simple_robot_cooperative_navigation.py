@@ -42,7 +42,8 @@ import rerun.blueprint as rrb
 import tqdm
 
 import rt_oac  # noqa: F401
-from rt_oac import metrics
+from rt_oac import metrics, tracking_cost
+from rt_oac.balanced_cost import make_balanced
 from rt_oac.controller import RTController
 
 mpl.use("Agg")
@@ -59,7 +60,26 @@ STEPS = 120
 SEED = 0
 INIT_FOLLOWER_OFFSET = np.array([0.0, 0.0, 0.0, 1.6, 1.6, 0.0])  # ~2.3 m initial error
 DIST_BOUNDS = (0.2, 6.0)
+# --- hybrid (--hybrid) mode: tracking/observability balance (PROGRESS section 7) ---
+# The follower tracks a moving formation standoff (leader prediction + offset) balanced with
+# observability via NormalizedWeightedSum. The unicycle has no relative-velocity state to damp,
+# so the anchor is position-only (indices 3,4). The estimator is already closed-loop here.
+FORMATION_OFFSET = X0[3:5] - X0[0:2]  # nominal follower-minus-leader offset = [-0.5, 5]
+HYBRID_POS_IDX = (3, 4)
+HYBRID_RHO = 1.0  # tracking scale (s_track = RHO^2 * window)
+HYBRID_WEIGHT = 1.0  # dimensionless observability weight in the normalized balance
 RESULTS = pathlib.Path(__file__).resolve().parents[1] / "results"
+
+
+def leader_pred(leader_state):
+    """(window, 2) predicted leader positions over the horizon (rolls LEADER_U)."""
+    px, py, th = leader_state
+    ks = np.arange(WINDOW)
+    v = LEADER_U[0]
+    return np.stack(
+        [px + ks * DT * v * np.cos(th), py + ks * DT * v * np.sin(th)], axis=1
+    )
+
 
 PureYaw = functools.partial(rr.RotationAxisAngle, axis=[0, 0, 1])
 
@@ -75,6 +95,39 @@ def build_controller():
     )
     ctrl = RTController(
         cost,
+        stlog_dt=STLOG_DT,
+        lb=np.array([0.0, -2.0]),
+        ub=np.array([4.0, 2.0]),
+        n_inputs=4,
+        follower_indices=(2, 3),
+        method="SLSQP",
+        maxiter=6,
+        constraint=mdl.interrobot_distance,
+        constraint_bounds=DIST_BOUNDS,
+    )
+    return ctrl, cost
+
+
+def build_hybrid_controller():
+    """Balanced cost (normalized observability + formation standoff anchor)."""
+    cost = observability_cost.ObservabilityCost(
+        mdl.dynamics,
+        mdl.observation,
+        DT,
+        gramian_kw={"order": 1, "var": VAR},
+        gramian_metric=metrics.neg_logdet,
+        observed_indices=(),
+    )
+    ref_us = np.tile(np.r_[LEADER_U, 1.0, 0.0], (WINDOW, 1))
+    s_obs = abs(float(cost(jnp.asarray(X0), jnp.asarray(ref_us), STLOG_DT).objective))
+    track = tracking_cost.quadratic_tracking_cost(
+        position_indices=HYBRID_POS_IDX, w_pos=1.0
+    )
+    bal = make_balanced(
+        cost, track, scheme="normalized", s_track=HYBRID_RHO**2 * WINDOW, s_obs=s_obs
+    )
+    ctrl = RTController(
+        bal,
         stlog_dt=STLOG_DT,
         lb=np.array([0.0, -2.0]),
         ub=np.array([4.0, 2.0]),
@@ -104,7 +157,7 @@ def _acc_min_eig(gram, x, u):
     return float(np.linalg.eigvalsh(acc)[0])
 
 
-def run(use_oac, ctrl, gram, *, stream=False, noac_err=None):
+def run(use_oac, ctrl, gram, *, stream=False, noac_err=None, hybrid=False):
     """One closed-loop run. If ``stream``, log it live to rerun (overlaying ``noac_err``)."""
     rng = np.random.default_rng(SEED)
     sim = jax.jit(
@@ -148,7 +201,11 @@ def run(use_oac, ctrl, gram, *, stream=False, noac_err=None):
             guess = np.tile(np.r_[LEADER_U, 1.0, 0.0], (WINDOW, 1))
             if prev_u is not None:
                 guess[:, 2:4] = np.vstack([prev_u[1:, 2:4], prev_u[-1:, 2:4]])
-            res = ctrl.solve(x_hat, guess)  # controller acts on the ESTIMATE
+            if hybrid:  # balanced cost: thread the moving formation standoff + weight
+                p_ref = leader_pred(x_hat[0:3]) + FORMATION_OFFSET
+                res = ctrl.solve(x_hat, guess, p_ref=p_ref, weight=HYBRID_WEIGHT)
+            else:
+                res = ctrl.solve(x_hat, guess)  # controller acts on the ESTIMATE
             prev_u = res.u
             u_foll = res.u[0, 2:4]
             rec["walls"].append(res.wall_time * 1e3)
@@ -261,15 +318,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spawn", action="store_true", help="launch the live rerun viewer")
     ap.add_argument("--save", type=str, default=None, help="record to this .rrd path")
+    ap.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="OAC = balanced cost (observability + formation standoff), not pure log-det",
+    )
     args = ap.parse_args()
 
-    ctrl, cost = build_controller()
+    ctrl, cost = build_hybrid_controller() if args.hybrid else build_controller()
     gram = jax.jit(
         lambda x, u: cost(x, jnp.asarray(u), STLOG_DT, return_gramians=True).gramians
     )
 
     rr.init("rt_oac_planar", spawn=args.spawn)
-    rrd = args.save or str(RESULTS / "example_planar.rrd")
+    suffix = "_hybrid" if args.hybrid else ""
+    rrd = args.save or str(RESULTS / f"example_planar{suffix}.rrd")
     if not args.spawn:
         rr.save(rrd)
     style_series()
@@ -277,16 +340,17 @@ def main():
 
     # no-OAC first (cheap, no solve) so its error can be overlaid on the live OAC run
     noac = run(False, ctrl, gram, stream=False)
-    oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"])
+    oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"], hybrid=args.hybrid)
 
-    summarize_and_plot(oac, noac)
+    summarize_and_plot(oac, noac, hybrid=args.hybrid)
     if not args.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
 
-def summarize_and_plot(oac, noac):
+def summarize_and_plot(oac, noac, hybrid=False):
     tt = np.arange(STEPS) * DT
-    print("=== RT-OAC planar cooperative navigation (frontier OPC + carried EKF) ===")
+    mode = "HYBRID (balanced obs+standoff)" if hybrid else "frontier OPC"
+    print(f"=== RT-OAC planar cooperative navigation ({mode} + carried EKF) ===")
     print("follower-position estimation error  |   no-OAC   |    OAC")
     print(
         f"  RMSE  [m]                          | {noac['rmse']:8.3f}   | {oac['rmse']:8.3f}"
@@ -414,7 +478,7 @@ def summarize_and_plot(oac, noac):
     ax.legend(fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out = RESULTS / "example_planar.png"
+    out = RESULTS / (f"example_planar{'_hybrid' if hybrid else ''}.png")
     fig.savefig(out, dpi=130)
     print(f"wrote {out}")
 
