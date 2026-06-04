@@ -36,7 +36,13 @@ Visualization is **rerun**, mirroring the companion repo's examples: a live 3D s
 time-series (open loop: plan time / observability / distance; hybrid: error & 3-sigma / NEES /
 distance / plan time). A comprehensive multi-panel matplotlib figure is rendered after the run.
 
-Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [--spawn]
+``--soft`` enforces the inter-drone distance band as a smooth penalty in the objective +
+an unconstrained L-BFGS-B solve instead of the hard SLSQP constraint (faster, fully JIT-able;
+see benchmarks/penalty_solver_probe.py). It is great for the open-loop orbit (~85 vs ~115 ms,
+band held) but NOT for ``--hybrid``: the delicate #8-resolved closed loop destabilizes under
+the soft penalty (it was validated only with the hard constraint), so keep hard there.
+
+Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [--spawn] [--soft]
 Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py --hybrid [--spawn]
 """
 
@@ -210,6 +216,11 @@ def main():
         action="store_true",
         help="tracking/observability balance + closed-loop ESEKF (resolves #8)",
     )
+    ap.add_argument(
+        "--soft",
+        action="store_true",
+        help="enforce the distance band as a soft penalty + unconstrained L-BFGS-B solve",
+    )
     args = ap.parse_args()
     # Hybrid's #8-resolution is a bounded, near-consistent loop with a slow residual drift, so it
     # defaults to a shorter validated horizon (120 steps) than the open-loop orbit (300).
@@ -243,6 +254,7 @@ def main():
         maxiter=6,
         constraint=mdl.interrobot_distance_squared,
         constraint_bounds=(lo**2, hi**2),
+        constraint_mode="soft" if args.soft else "hard",
     )
     dt = sc.cfg["sim"]["integrator_dt"]
     sim = jax.jit(
@@ -545,6 +557,7 @@ def run_hybrid(sc, args, lo, hi):
         maxiter=6,
         constraint=mdl.interrobot_distance_squared,
         constraint_bounds=(lo**2, hi**2),
+        constraint_mode="soft" if args.soft else "hard",
     )
     p_ref = np.tile(HYBRID_STANDOFF, (sc.window, 1))
 

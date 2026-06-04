@@ -20,9 +20,14 @@ plus live time-series of the OAC-vs-no-OAC estimation error, the accumulated obs
 the solve time, and the inter-robot distance. A comprehensive multi-panel matplotlib figure
 is rendered after the run.
 
+Toggles: ``--hybrid`` swaps the log-det OAC for the balanced cost (observability + formation
+standoff, PROGRESS section 7); ``--soft`` enforces the inter-robot distance band as a smooth
+penalty + unconstrained L-BFGS-B instead of the hard SLSQP constraint (faster, JIT-able). Both
+work here (and compose), unlike the quadrotor hybrid, which needs the hard constraint.
+
 Live viewer:    uv run python examples/simple_robot_cooperative_navigation.py --spawn
 Headless (default; writes results/example_planar.rrd + .png):
-                uv run python examples/simple_robot_cooperative_navigation.py
+                uv run python examples/simple_robot_cooperative_navigation.py [--hybrid] [--soft]
 """
 
 import argparse
@@ -84,7 +89,7 @@ def leader_pred(leader_state):
 PureYaw = functools.partial(rr.RotationAxisAngle, axis=[0, 0, 1])
 
 
-def build_controller():
+def build_controller(soft=False):
     cost = observability_cost.ObservabilityCost(
         mdl.dynamics,
         mdl.observation,
@@ -104,11 +109,12 @@ def build_controller():
         maxiter=6,
         constraint=mdl.interrobot_distance,
         constraint_bounds=DIST_BOUNDS,
+        constraint_mode="soft" if soft else "hard",
     )
     return ctrl, cost
 
 
-def build_hybrid_controller():
+def build_hybrid_controller(soft=False):
     """Balanced cost (normalized observability + formation standoff anchor)."""
     cost = observability_cost.ObservabilityCost(
         mdl.dynamics,
@@ -137,6 +143,7 @@ def build_hybrid_controller():
         maxiter=6,
         constraint=mdl.interrobot_distance,
         constraint_bounds=DIST_BOUNDS,
+        constraint_mode="soft" if soft else "hard",
     )
     return ctrl, cost
 
@@ -323,9 +330,18 @@ def main():
         action="store_true",
         help="OAC = balanced cost (observability + formation standoff), not pure log-det",
     )
+    ap.add_argument(
+        "--soft",
+        action="store_true",
+        help="enforce the distance band as a soft penalty + unconstrained L-BFGS-B solve",
+    )
     args = ap.parse_args()
 
-    ctrl, cost = build_hybrid_controller() if args.hybrid else build_controller()
+    ctrl, cost = (
+        build_hybrid_controller(args.soft)
+        if args.hybrid
+        else build_controller(args.soft)
+    )
     gram = jax.jit(
         lambda x, u: cost(x, jnp.asarray(u), STLOG_DT, return_gramians=True).gramians
     )

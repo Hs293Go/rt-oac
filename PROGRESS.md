@@ -99,6 +99,12 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
   at w=100 vs 128 ms hard) with **zero band violation** — at a modest observability cost (the
   penalty keeps the follower off the bound that log-det rides; higher w is tighter/feasibler but
   slower). No active-set machinery → fully JIT-able, the foundation for a JAX-native solver.
+  Now a first-class option: `RTController(constraint_mode="soft")` folds the *existing* constraint
+  fn into the objective and solves box-bounded L-BFGS-B (a `--soft` toggle on both examples). The
+  branching stayed clean — encapsulated in the controller, the examples pass one param — so soft was
+  **not** promoted to the default. Finding: soft is faster and feasible for the open-loop orbit
+  (~85 vs ~115 ms) and the planar case, but the *delicate quadrotor hybrid #8-loop destabilizes
+  under it* (it was validated only with the hard constraint), so hard stays the default there.
 - **Sim-to-real ladder** — PX4 SITL → HIL on Jetson → flight (controller fixed, swap plant/sensors).
 
 ## 6. Headline examples & live visualization

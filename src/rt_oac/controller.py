@@ -64,6 +64,8 @@ class RTController:
         maxiter: int = 80,
         constraint: Callable | None = None,
         constraint_bounds: tuple[float, float] | None = None,
+        constraint_mode: str = "hard",
+        penalty_weight: float = 10.0,
     ):
         self._cost = cost
         self._dt = float(stlog_dt)
@@ -76,6 +78,14 @@ class RTController:
         self._maxiter = maxiter
         self._constraint = constraint
         self._constraint_bounds = constraint_bounds
+        # "hard": pass the constraint to the (SLSQP/trust-constr) solver. "soft": fold
+        # it into the objective as a smooth one-sided penalty and solve box-bounded
+        # unconstrained (L-BFGS-B) -- faster, fully JIT-able, same constraint reused.
+        self._soft = constraint_mode == "soft"
+        self._penalty_weight = float(penalty_weight)
+        self._con_takes_cost = constraint is not None and (
+            "cost" in inspect.signature(constraint).parameters
+        )
 
         # free-variable bounds (follower columns only), flattened over the window
         self._lb = np.asarray(lb)
@@ -103,18 +113,34 @@ class RTController:
         full = full.at[:, self._leader].set(u_const)
         return full.at[:, self._follower].set(free.reshape(window, -1))
 
+    def _eval_constraint(self, u, x0):
+        if self._con_takes_cost:
+            return self._constraint(x0, u, cost=self._cost)
+        return self._constraint(x0, u)
+
+    def _penalty(self, u, x0):
+        """Smooth one-sided penalty enforcing ``lo <= constraint <= hi``."""
+        c = self._eval_constraint(u, x0)
+        lo, hi = self._constraint_bounds
+        viol = jnp.maximum(c - hi, 0.0) ** 2 + jnp.maximum(lo - c, 0.0) ** 2
+        return self._penalty_weight * viol.sum()
+
     def _objective(self, free, u_const, x0):
-        return self._cost(x0, self._recombine(free, u_const), self._dt).objective
+        u = self._recombine(free, u_const)
+        obj = self._cost(x0, u, self._dt).objective
+        if self._soft and self._constraint is not None:
+            obj += self._penalty(u, x0)
+        return obj
 
     def _objective_threaded(self, free, u_const, x0, p_ref, weight):
         u = self._recombine(free, u_const)
-        return self._cost.evaluate(x0, u, self._dt, p_ref, weight).objective
+        obj = self._cost.evaluate(x0, u, self._dt, p_ref, weight).objective
+        if self._soft and self._constraint is not None:
+            obj += self._penalty(u, x0)
+        return obj
 
     def _constraint_value(self, free, u_const, x0):
-        u = self._recombine(free, u_const)
-        if "cost" in inspect.signature(self._constraint).parameters:
-            return self._constraint(x0, u, cost=self._cost)
-        return self._constraint(x0, u)
+        return self._eval_constraint(self._recombine(free, u_const), x0)
 
     # ---- solve --------------------------------------------------------------------
     def solve(
@@ -178,17 +204,25 @@ class RTController:
                 cache["key"], cache["val"] = key, fun_and_jac(free)
             return cache["val"][1]
 
-        constraints = self._build_constraints(u_const, x0, window)
-
         t = time.perf_counter()
-        if self._method == "SLSQP":
+        if self._soft:
+            # constraint folded into the objective -> box-bounded unconstrained solve
+            soln = optimize.minimize(
+                fun,
+                free0,
+                jac=jac,
+                method="L-BFGS-B",
+                bounds=optimize.Bounds(lb, ub),
+                options={"maxiter": self._maxiter},
+            )
+        elif self._method == "SLSQP":
             soln = optimize.minimize(
                 fun,
                 free0,
                 jac=jac,
                 method="SLSQP",
                 bounds=list(zip(lb, ub, strict=True)),
-                constraints=constraints,
+                constraints=self._build_constraints(u_const, x0, window),
                 options={"maxiter": self._maxiter},
             )
         else:
@@ -198,7 +232,7 @@ class RTController:
                 jac=jac,
                 method=self._method,
                 bounds=optimize.Bounds(lb, ub),
-                constraints=constraints,
+                constraints=self._build_constraints(u_const, x0, window),
                 options={"maxiter": self._maxiter, "verbose": 0},
             )
         wall = time.perf_counter() - t
