@@ -26,6 +26,22 @@ seed: 0 # RNG seed for the closed-loop noise (process/measurement/input)
 #   both false (#8)    -- carry the mean AND plan the control on it (the real closed loop).
 reanchor: false
 plan_on_truth: false
+# Annealed "training-wheels" truth-anchor (sim-only): pull the carried EKF mean a fraction
+# alpha(i) toward truth via a covariance-consistent pseudo-measurement. alpha(i) = anchor_alpha0
+# for anchor_hold steps, then linearly anneals to 0 over anchor_anneal steps (0 = sharp release),
+# then 0 (carried). anchor_alpha0=0 disables it. The deployable loop is always alpha=0.
+anchor_alpha0: 0.0
+anchor_hold: 0
+anchor_anneal: 0
+# M2 estimator-consistency knobs (deployable, truth-free): fight the position-block over-confidence
+# (M0). proc_pos_scale inflates the position process noise; p_pos_floor lower-bounds trace(P[pos])
+# additively after each update; fej freezes the EKF Jacobians at a reference re-set every fej_epoch
+# steps (First-Estimates Jacobian -- blocks spurious info gain in the unobservable subspace).
+proc_pos_scale: 1.0
+p_pos_floor: 0.0
+fej: false
+fej_epoch: 15
+filter: ekf # closed-loop estimator: ekf (ErrorStateEKF) | ukf (manifold UKF, derivative-free)
 report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
 
 hydra:

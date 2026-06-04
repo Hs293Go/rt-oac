@@ -77,6 +77,7 @@ from rt_oac.balanced_cost import make_balanced
 from rt_oac.controller import RTController
 from rt_oac.error_state_ekf import ErrorStateEKF
 from rt_oac.scenario import build_scenario
+from rt_oac.unscented_kf import ManifoldUKF
 from rt_oac.warmstart import warm_guess
 
 mpl.use("Agg")
@@ -520,6 +521,28 @@ def _tangent_error(x_hat, x_true):
     return np.concatenate([diff[0:3], dtheta, diff[7:10]])
 
 
+_NEES_BLOCKS = {"pos": slice(0, 3), "rot": slice(3, 6), "vel": slice(6, 9)}
+
+
+def _block_nees(err_t, P):
+    """Per-sub-block NEES (pos/rot/vel), each ~ chi^2_3 -- localizes over/under-confidence."""
+    out = {}
+    for name, sl in _NEES_BLOCKS.items():
+        e = err_t[sl]
+        out[name] = float(e @ np.linalg.solve(P[sl, sl] + 1e-12 * np.eye(3), e))
+    return out
+
+
+def anchor_alpha(i, a0, hold, anneal):
+    """Training-wheels schedule alpha(i): hold at ``a0`` for ``hold`` steps, then linearly
+    anneal to 0 over ``anneal`` steps (anneal=0 = sharp release), then 0 (carried). a0=0 = off."""
+    if a0 <= 0 or i < hold:
+        return a0
+    if anneal <= 0 or i >= hold + anneal:
+        return 0.0
+    return a0 * (1.0 - (i - hold) / anneal)
+
+
 def run_closed_loop(sc, cfg, lo, hi):
     """Closed-loop ESEKF: the controller acts on the EKF *estimate*, not truth.
 
@@ -575,12 +598,14 @@ def run_closed_loop(sc, cfg, lo, hi):
     res_var = np.concatenate([[range_var], np.full(3, att_var)])
     input_var = np.tile([0.05, 0.01, 0.01, 0.01], 2)
     proc_var = np.array([0.02, 0.02, 0.02, 1e-4, 1e-4, 1e-4, 0.05, 0.05, 0.05])
+    proc_var[0:3] *= float(cfg.proc_pos_scale)  # M2: inflate the position process noise
     sim = jax.jit(
         integrator.Integrator(
             mdl.dynamics, integrator.Methods.EULER, stepsize=dt, manifold=mdl.MANIFOLD
         )
     )
-    ekf = ErrorStateEKF(
+    filter_cls = ManifoldUKF if str(cfg.filter) == "ukf" else ErrorStateEKF
+    ekf = filter_cls(
         mdl.dynamics,
         lambda x: mdl.observation(x),
         mdl.MANIFOLD,
@@ -636,7 +661,21 @@ def run_closed_loop(sc, cfg, lo, hi):
 
     rec = {
         k: []
-        for k in ("rel", "lead", "ftrue", "fest", "err", "sig", "nees", "dist", "walls")
+        for k in (
+            "rel",
+            "lead",
+            "ftrue",
+            "fest",
+            "err",
+            "sig",
+            "nees",
+            "dist",
+            "walls",
+            "nees_pos",
+            "nees_rot",
+            "nees_vel",
+            "alpha",
+        )
     }
     scheduled = hybrid and bool(cfg.mode.schedule)
     reanchor = bool(
@@ -645,6 +684,15 @@ def run_closed_loop(sc, cfg, lo, hi):
     plan_on_truth = bool(
         cfg.plan_on_truth
     )  # perfect-feedback OA traj; EKF passive (diagnostic)
+    # Annealed "training-wheels" truth-anchor (sim-only): a partial pseudo-measurement of the
+    # true relative state, strength alpha(i) (a0 at t=0, held, then annealed to 0 = carried).
+    a0_anchor = float(cfg.anchor_alpha0)
+    hold_anchor, anneal_anchor = int(cfg.anchor_hold), int(cfg.anchor_anneal)
+    # M2 estimator-consistency knobs (truth-free): First-Estimates Jacobian (freeze the EKF
+    # linearization point, reset every fej_epoch) + a covariance floor on trace(P[pos]).
+    fej, fej_epoch = bool(cfg.fej), int(cfg.fej_epoch)
+    p_pos_floor = float(cfg.p_pos_floor)
+    x_lin = x_hat.copy()  # FEJ linearization reference
     weight = float(cfg.mode.weight) if hybrid else 1.0
     if scheduled:
         s0 = float(cfg.mode.s0)
@@ -674,7 +722,19 @@ def run_closed_loop(sc, cfg, lo, hi):
         prev_u = res.u
         u = res.u[0].copy()
         u[4:] += rng.normal(0, np.sqrt(input_var[4:]))
-        x_hat, P = ekf.predict(jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(u), dt)
+        if fej and i % fej_epoch == 0:
+            x_lin = (
+                x_hat.copy()
+            )  # reset the FEJ linearization point to the current estimate
+        jx_lin = jnp.asarray(x_lin)
+        if fej:
+            x_hat, P = ekf.predict_fej(
+                jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(u), dt, jx_lin
+            )
+        else:
+            x_hat, P = ekf.predict(
+                jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(u), dt
+            )
         x_hat, P = np.array(x_hat), np.array(P)
         x_true = renorm(sim(jnp.asarray(x_true), jnp.asarray(u))[0])
         y = np.array(mdl.observation(jnp.asarray(x_true))) + rng.normal(
@@ -683,11 +743,33 @@ def run_closed_loop(sc, cfg, lo, hi):
         # Estimator surprise: range-channel innovation NIS at the prior (before the update).
         nu_range = float(y[0] - np.asarray(mdl.observation(jnp.asarray(x_hat)))[0])
         prev_nis = nu_range**2 / range_var
-        x_hat, P = ekf.update(jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(y))
+        if fej:
+            x_hat, P = ekf.update_fej(
+                jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(y), jx_lin
+            )
+        else:
+            x_hat, P = ekf.update(jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(y))
         x_hat, P = np.array(x_hat), np.array(P)
+        # Training wheels: pull the carried estimate a fraction alpha(i) toward truth via a
+        # covariance-consistent pseudo-measurement (R = P (1-a)/a => gain a*I). alpha=0 = off.
+        alpha = min(anchor_alpha(i, a0_anchor, hold_anchor, anneal_anchor), 0.999)
+        if alpha > 0:
+            r_anchor = P * (1.0 - alpha) / alpha
+            x_hat, P = ekf.update_anchor(
+                jnp.asarray(x_hat),
+                jnp.asarray(P),
+                jnp.asarray(x_true),
+                jnp.asarray(r_anchor),
+            )
+            x_hat, P = np.array(x_hat), np.array(P)
+        if p_pos_floor > 0:  # M2: PSD-safe lower bound on trace(P[pos]) -- stay honest
+            tr = float(np.trace(P[0:3, 0:3]))
+            if tr < p_pos_floor:
+                P[0:3, 0:3] += ((p_pos_floor - tr) / 3.0) * np.eye(3)
 
         err_t = _tangent_error(x_hat, x_true)
         nees = float(err_t @ np.linalg.solve(P + 1e-12 * np.eye(9), err_t))
+        bnees = _block_nees(err_t, P)
         err = float(np.linalg.norm(x_hat[0:3] - x_true[0:3]))
         sig = float(3 * np.sqrt(max(np.trace(P[0:3, 0:3]) / 3, 0)))
         dist = float(np.linalg.norm(x_true[0:3]))
@@ -709,6 +791,10 @@ def run_closed_loop(sc, cfg, lo, hi):
             ("nees", nees),
             ("dist", dist),
             ("walls", res.wall_time * 1e3),
+            ("nees_pos", bnees["pos"]),
+            ("nees_rot", bnees["rot"]),
+            ("nees_vel", bnees["vel"]),
+            ("alpha", alpha),
         ):
             rec[k].append(v)
 
@@ -744,6 +830,19 @@ def run_closed_loop(sc, cfg, lo, hi):
         f"NEES median (after step {warmup}) {np.median(out['nees'][warmup:]):.1f} (E=9) | "
         f"distance [{out['dist'].min():.2f}, {out['dist'].max():.2f}] m (band [{lo:.1f}, {hi:.1f}])"
     )
+    print(
+        f"block NEES (after {warmup}) pos {np.median(out['nees_pos'][warmup:]):.1f} "
+        f"rot {np.median(out['nees_rot'][warmup:]):.1f} vel "
+        f"{np.median(out['nees_vel'][warmup:]):.1f} (E=3 each)"
+    )
+    # M1 discriminator: health over the wheels-OFF steps (alpha==0, after warmup). For a pure
+    # carried run this is the whole run; for an annealed run it is the post-release segment.
+    off = (out["alpha"] == 0) & (np.arange(cfg.steps) >= warmup)
+    if off.any():
+        print(
+            f"wheels-off (alpha=0, frac {float((out['alpha'] == 0).mean()):.2f}): "
+            f"NEES median {np.median(out['nees'][off]):.1f} err max {out['err'][off].max():.2f} m"
+        )
     standoff = np.asarray(cfg.mode.standoff[0:3]) if hybrid else None
     plot_hybrid(out, dt, lo, hi, cfg.steps, mode, hybrid, standoff)
     if cfg.report:
@@ -760,6 +859,9 @@ def run_closed_loop(sc, cfg, lo, hi):
                 "hybrid": hybrid,
                 "reanchor": reanchor,
                 "plan_on_truth": plan_on_truth,
+                "anchor_alpha0": a0_anchor,
+                "anchor_hold": hold_anchor,
+                "anchor_anneal": anneal_anchor,
                 "feedback": "estimate",
                 "objective": "balanced" if hybrid else "softmin",
                 "steps": int(cfg.steps),
@@ -772,6 +874,9 @@ def run_closed_loop(sc, cfg, lo, hi):
                 "err_rmse_m": float(np.sqrt((out["err"] ** 2).mean())),
                 "plan_median_ms": float(np.median(out["walls"][1:])),
                 "nees_median": float(np.median(out["nees"][warmup:])),
+                "nees_pos_median": float(np.median(out["nees_pos"][warmup:])),
+                "nees_rot_median": float(np.median(out["nees_rot"][warmup:])),
+                "nees_vel_median": float(np.median(out["nees_vel"][warmup:])),
                 "in3s": float(np.mean(out["err"] <= out["sig"])),
                 "dist_min": float(out["dist"].min()),
                 "dist_max": float(out["dist"].max()),
