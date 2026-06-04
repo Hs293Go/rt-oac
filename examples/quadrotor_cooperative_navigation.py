@@ -22,45 +22,46 @@ distance constraint inactive, whereas log-det pins the follower to the max-dista
 (active constraint => costlier SLSQP QP). See ``PROGRESS.md``, ``results/phase0_findings.md``,
 and benchmarks/{objective_solver_profile,objective_eval_microbench}.py.
 
-Three modes -- a pedagogical arc through finding #8:
-  * default = *open-loop planner*: perfect state feedback (the planner sees the true relative
-    state), the soft-min orbit, the level-cruise leader -- the pretty observability orbit;
-  * ``--estimation`` = **estimation in the loop**: the same pure observability, but the
+Config is **Hydra** (conf/quadrotor.yaml + conf/mode/*.yaml); the ``mode`` group selects a
+pedagogical arc through finding #8 (override on the CLI, e.g. ``mode=hybrid``):
+  * ``mode=open`` (default) = *open-loop planner*: perfect state feedback (the planner sees the
+    true relative state), the soft-min orbit, the level-cruise leader -- the pretty orbit;
+  * ``mode=estimation`` = **estimation in the loop**: the same pure observability, but the
     controller now acts on the ``ErrorStateEKF`` *estimate* -- the orbit *diverges* (finding #8);
-  * ``--hybrid`` = the **resolved closed loop**: estimation in the loop + the tracking/
+  * ``mode=hybrid`` = the **resolved closed loop**: estimation in the loop + the tracking/
     observability balanced cost (NormalizedWeightedSum with a velocity-damped standoff anchor,
     the golden form). Keeps the loop bounded and the estimator near-consistent (error within
     3-sigma, NEES in/near the chi-square band) -- a partial resolution with a slow residual
     drift over long horizons.
 See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
 
-Visualization is **rerun**, mirroring the companion repo's examples: a live 3D scene plus live
-time-series (open loop: plan time / observability / distance; hybrid: error & 3-sigma / NEES /
-distance / plan time). A comprehensive multi-panel matplotlib figure is rendered after the run.
+Visualization is **rerun**: a live 3D scene plus live time-series (open loop: plan time /
+observability / distance; closed loop: error & 3-sigma / NEES / distance / plan time). A
+comprehensive multi-panel matplotlib figure is rendered after the run.
 
-``--soft`` enforces the inter-drone distance band as a smooth penalty in the objective +
-an unconstrained L-BFGS-B solve instead of the hard SLSQP constraint (faster, fully JIT-able;
-see benchmarks/penalty_solver_probe.py). It is great for the open-loop orbit (~85 vs ~115 ms,
-band held) but NOT for ``--hybrid``: the delicate #8-resolved closed loop destabilizes under
-the soft penalty (it was validated only with the hard constraint), so keep hard there.
+``soft=true`` enforces the inter-drone distance band as a smooth penalty + an unconstrained
+L-BFGS-B solve instead of the hard SLSQP constraint (faster, fully JIT-able; see
+benchmarks/penalty_solver_probe.py). Great for the open-loop orbit (~85 vs ~115 ms, band held)
+but NOT for ``mode=hybrid`` (the delicate loop destabilizes under it -- keep hard there).
 
-Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [--spawn] [--soft]
-Estimation:   uv run python examples/quadrotor_cooperative_navigation.py --estimation   (shows #8)
-Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py --hybrid       (resolves #8)
+Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [spawn=true] [soft=true]
+Estimation:   uv run python examples/quadrotor_cooperative_navigation.py mode=estimation  (shows #8)
+Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py mode=hybrid      (resolves #8)
 """
 
-import argparse
 import dataclasses
 import pathlib
 
 from example_lib import math as elmath
 from example_lib.models import inter_quadrotor_pose as mdl
 from example_lib.visualization import visualization as viz
+import hydra
 import jax
 import jax.numpy as jnp
 import matplotlib as mpl
 import numpy as np
 from observability_aware_control import integrator
+from omegaconf import DictConfig
 import rerun as rr
 import rerun.blueprint as rrb
 from scipy import stats
@@ -78,39 +79,11 @@ mpl.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-STEPS = 300  # x integrator_dt (0.05 s) = 15 s
-# Distance band tightened to [1, 2] m (vs the paper's [1, 3]): a narrow band that brackets
-# the start radius turns the motion into a clean constant-radius orbit instead of pegging at
-# a far baseline. See benchmarks/quad_constraint_sweep.py for the band/objective sweep.
-MIN_DIST, MAX_DIST = 1.0, 2.0
-# Leader cruise speed. The paper's recorded leader is a min-snap 10 m / 120 s hop (peak
-# ~0.16 m/s), so over this 15 s window it covers ~0.16 m -- visually frozen. The relative
-# dynamics are Galilean-invariant (a common translation cancels in the relative state), so a
-# faster *level* constant-velocity leader leaves the follower's orbit, observability, and
-# solve time identical (verified in benchmarks/leader_speed_sweep.py) and only stretches the
-# world-frame scene into a helix. 2 m/s covers ~30 m in 15 s -- a clear, realistic cruise.
-LEADER_SPEED = 2.0
-LEADER_ALT = 10.0
-# --- hybrid (--hybrid) mode: tracking/observability balance + closed-loop ESEKF ---
-# Standoff anchor = a stationary relative-state set-point: relative position r_lf -> STANDOFF
-# AND relative velocity v_lf -> 0 (velocity damping is essential; position alone cannot arrest
-# the drift). Balanced with observability via NormalizedWeightedSum (the golden form, PROGRESS
-# section 7); the controller acts on the ESEKF estimate, so this is the #8-resolved closed loop.
-# The hybrid uses the tighter [0.5, 1.2] m band (the aggressive regime that triggers #8 and
-# where the resolution is validated, experiments/drone_coupling_eval.py) rather than the
-# open-loop orbit's [1, 2] m.
-HYBRID_MIN_DIST, HYBRID_MAX_DIST = 0.5, 1.2
-HYBRID_POS_IDX = (0, 1, 2, 7, 8, 9)
-HYBRID_STANDOFF = np.array([
-    1.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-])  # 1.0 m standoff in [0.5, 1.2]
-HYBRID_RHO = 0.5  # tracking scale (s_track = RHO^2 * window)
-HYBRID_WEIGHT = 1.0  # dimensionless observability weight in the normalized balance
+# Run config (mode arc, band, horizon, leader speed, soft/spawn/save) lives in conf/ -- see
+# conf/quadrotor.yaml + conf/mode/{open,estimation,hybrid}.yaml. The mode group bundles
+# feedback/objective/band/horizon (and the velocity-damped standoff anchor for hybrid), so the
+# three-mode #8 arc is one key (mode=open|estimation|hybrid) rather than a tangle of flags.
+LEADER_ALT = 10.0  # world-frame altitude of the synthesized level-cruise leader
 RESULTS = pathlib.Path(__file__).resolve().parents[1] / "results"
 
 
@@ -207,49 +180,24 @@ def analyze_gramian_spectrum(g: jax.Array):
     return ndir, mineig
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--steps", type=int, default=None, help="default 300 open-loop, 120 hybrid"
-    )
-    ap.add_argument("--spawn", action="store_true", help="launch the live rerun viewer")
-    ap.add_argument("--save", type=str, default=None, help="record to this .rrd path")
-    ap.add_argument(
-        "--estimation",
-        action="store_true",
-        help="estimation in the loop (ESEKF feedback), pure observability -- demonstrates #8",
-    )
-    ap.add_argument(
-        "--hybrid",
-        action="store_true",
-        help="estimation in the loop + tracking/observability balance (resolves #8)",
-    )
-    ap.add_argument(
-        "--soft",
-        action="store_true",
-        help="enforce the distance band as a soft penalty + unconstrained L-BFGS-B solve",
-    )
-    args = ap.parse_args()
-    # The closed-loop (estimation/hybrid) modes default to a shorter validated horizon (120
-    # steps) than the open-loop orbit (300); #8 divergence / its resolution both show by then.
-    closed_loop = args.hybrid or args.estimation
-    if args.steps is None:
-        args.steps = 120 if closed_loop else STEPS
-
+@hydra.main(version_base=None, config_path="conf", config_name="quadrotor")
+def main(cfg: DictConfig):
+    # The mode (conf/mode/*.yaml) bundles feedback/objective/band/horizon; steps falls back to
+    # the mode's validated default (open=300; closed-loop=120, where #8 / its resolution show).
+    cfg.steps = cfg.steps if cfg.steps is not None else cfg.mode.default_steps
+    lo, hi = float(cfg.mode.band[0]), float(cfg.mode.band[1])
     sc = build_scenario(gramian_metric=metrics.neg_softmin_eig)
-    lo, hi = MIN_DIST, MAX_DIST
-    if closed_loop:
+    if cfg.mode.feedback == "estimate":
         # Closed-loop modes keep the scenario's default leader -- the config the coupling work
-        # was validated on (drone_coupling_eval.py). The level-cruise override below is only for
-        # the open-loop pretty-orbit demo; under estimate feedback a fast leader destabilizes the
-        # standoff-tracking loop, so the closed loop runs against the as-validated leader.
-        run_closed_loop(sc, args, lo, hi, hybrid=args.hybrid)
+        # was validated on (drone_coupling_eval.py). The level-cruise override below is open-loop
+        # only; under estimate feedback a fast leader destabilizes the standoff-tracking loop.
+        run_closed_loop(sc, cfg, lo, hi)
         return
-    # Replace the near-frozen min-snap leader with a level constant-velocity cruise so the
-    # world-frame scene covers ground; the relative orbit is unchanged (Galilean invariance).
-    n_lead = args.steps + sc.window + 1
+    # Open-loop orbit: replace the near-frozen min-snap leader with a level constant-velocity
+    # cruise so the world-frame scene covers ground (the relative orbit is Galilean-invariant).
+    n_lead = cfg.steps + sc.window + 1
     x_leader, u_leader = level_cruise_leader(
-        LEADER_SPEED, n_lead, sc.cfg["sim"]["integrator_dt"]
+        cfg.leader_speed, n_lead, sc.cfg["sim"]["integrator_dt"]
     )
     sc = dataclasses.replace(sc, x_leader=x_leader, u_leader=u_leader)
     ctrl = RTController(
@@ -263,7 +211,7 @@ def main():
         maxiter=6,
         constraint=mdl.interrobot_distance_squared,
         constraint_bounds=(lo**2, hi**2),
-        constraint_mode="soft" if args.soft else "hard",
+        constraint_mode="soft" if cfg.soft else "hard",
     )
     dt = sc.cfg["sim"]["integrator_dt"]
     sim = jax.jit(
@@ -276,9 +224,9 @@ def main():
     )
 
     # --- rerun setup ---
-    rr.init("rt_oac_quadrotor", spawn=args.spawn)
-    rrd = args.save or str(RESULTS / "example_quadrotor.rrd")
-    if not args.spawn:
+    rr.init("rt_oac_quadrotor", spawn=cfg.spawn)
+    rrd = cfg.save or str(RESULTS / "example_quadrotor.rrd")
+    if not cfg.spawn:
         rr.save(rrd)
     style_series(lo, hi)
     send_blueprint()
@@ -286,7 +234,7 @@ def main():
     # Note: set time before initializing lines/frames
     rr.set_time("/time", duration=0)
     # Static world: the recorded leader path (so the live scene has context from t=0).
-    lead_path = np.asarray(sc.x_leader[: args.steps, 0:3])
+    lead_path = np.asarray(sc.x_leader[: cfg.steps, 0:3])
     rr.log(
         "/sim/leader/path",
         rr.LineStrips3D(lead_path[None], colors=[90, 90, 90]),
@@ -296,9 +244,9 @@ def main():
     # SAME entity path, so the axes (and the body frame) move with the pose; traces are
     # logged in world coordinates as siblings (not double-transformed).
     leader_viz = viz.PoseReferenceFrame("/sim/leader")
-    leader_tr = viz.PositionTrace("/sim/leader", max_length=args.steps)
+    leader_tr = viz.PositionTrace("/sim/leader", max_length=cfg.steps)
     foll_viz = viz.PoseReferenceFrame("/sim/follower")
-    foll_tr = viz.PositionTrace("/sim/follower", max_length=args.steps)
+    foll_tr = viz.PositionTrace("/sim/follower", max_length=cfg.steps)
 
     x = np.concatenate([[2.0, 0.0, 0.0], quat_z(20), [0.0, 1.0, 0.0]])  # non-MUC start
     rec = {
@@ -306,7 +254,7 @@ def main():
     }
     prev_u = None
     t = 0.0
-    for i in tqdm.trange(args.steps):
+    for i in tqdm.trange(cfg.steps):
         guess = warm_guess(sc.reference_guess(i), prev_u)
         res = ctrl.solve(x, guess)  # perfect feedback: planner sees true x
         prev_u = res.u
@@ -354,8 +302,8 @@ def main():
         x = renorm(sim(jnp.asarray(x), jnp.asarray(res.u[0]))[0])
         t += dt
 
-    summarize_and_plot(rec, dt, lo, hi, args.steps)
-    if not args.spawn:
+    summarize_and_plot(rec, dt, lo, hi, cfg.steps)
+    if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
 
@@ -524,19 +472,16 @@ def _tangent_error(x_hat, x_true):
     return np.concatenate([diff[0:3], dtheta, diff[7:10]])
 
 
-def run_closed_loop(sc, args, lo, hi, *, hybrid):
+def run_closed_loop(sc, cfg, lo, hi):
     """Closed-loop ESEKF: the controller acts on the EKF *estimate*, not truth.
 
-    ``hybrid=False`` (``--estimation``): pure observability (soft-min, no anchor) -- the #8
-    pathology, where the orbit diverges under estimate feedback. ``hybrid=True`` (``--hybrid``):
-    the balanced cost (observability + velocity-damped standoff anchor) keeps it bounded and the
-    estimator consistent. See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
+    ``mode=estimation`` (objective=softmin, no anchor): pure observability -- the #8 pathology,
+    where the orbit diverges under estimate feedback. ``mode=hybrid`` (objective=balanced): the
+    balanced cost (observability + velocity-damped standoff anchor from cfg.mode) keeps it bounded
+    and the estimator consistent. See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
     """
+    hybrid = cfg.mode.objective == "balanced"
     dt = sc.cfg["sim"]["integrator_dt"]
-    lo, hi = (
-        HYBRID_MIN_DIST,
-        HYBRID_MAX_DIST,
-    )  # tight band: the #8 regime + its resolution
     x0 = np.concatenate([
         [1.0, 0.0, 0.0],
         quat_z(20),
@@ -548,16 +493,16 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
             float(sc.cost(jnp.asarray(x0), jnp.asarray(ref_us), sc.stlog_dt).objective)
         )
         track = tracking_cost.quadratic_tracking_cost(
-            position_indices=HYBRID_POS_IDX, w_pos=1.0
+            position_indices=tuple(cfg.mode.pos_idx), w_pos=1.0
         )
         cost = make_balanced(
             sc.cost,
             track,
             scheme="normalized",
-            s_track=HYBRID_RHO**2 * sc.window,
+            s_track=float(cfg.mode.rho) ** 2 * sc.window,
             s_obs=s_obs,
         )
-        p_ref = np.tile(HYBRID_STANDOFF, (sc.window, 1))
+        p_ref = np.tile(np.asarray(cfg.mode.standoff), (sc.window, 1))
     else:
         cost, p_ref = (
             sc.cost,
@@ -574,7 +519,7 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
         maxiter=6,
         constraint=mdl.interrobot_distance_squared,
         constraint_bounds=(lo**2, hi**2),
-        constraint_mode="soft" if args.soft else "hard",
+        constraint_mode="soft" if cfg.soft else "hard",
     )
 
     range_var, att_var = sc.cfg["noise"]["range_var"], sc.cfg["noise"]["att_var"]
@@ -598,9 +543,9 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
     )
 
     mode = "hybrid" if hybrid else "estimation"
-    rr.init(f"rt_oac_quadrotor_{mode}", spawn=args.spawn)
-    rrd = args.save or str(RESULTS / f"example_quadrotor_{mode}.rrd")
-    if not args.spawn:
+    rr.init(f"rt_oac_quadrotor_{mode}", spawn=cfg.spawn)
+    rrd = cfg.save or str(RESULTS / f"example_quadrotor_{mode}.rrd")
+    if not cfg.spawn:
         rr.save(rrd)
     for path, (name, col) in {
         "/graphs/error/err": ("rel-pos error [m]", [230, 40, 40]),
@@ -630,9 +575,9 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
         )
     )
     leader_viz = viz.PoseReferenceFrame("/sim/leader")
-    leader_tr = viz.PositionTrace("/sim/leader", max_length=args.steps)
+    leader_tr = viz.PositionTrace("/sim/leader", max_length=cfg.steps)
     ft_viz = viz.PoseReferenceFrame("/sim/follower_true")
-    ft_tr = viz.PositionTrace("/sim/follower_true", max_length=args.steps)
+    ft_tr = viz.PositionTrace("/sim/follower_true", max_length=cfg.steps)
     fe_viz = viz.PoseReferenceFrame("/sim/follower_est")
 
     rng = np.random.default_rng(0)
@@ -645,12 +590,11 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
         k: []
         for k in ("rel", "lead", "ftrue", "fest", "err", "sig", "nees", "dist", "walls")
     }
+    weight = float(cfg.mode.weight) if hybrid else 1.0
     prev_u, t, dof = None, 0.0, 9
-    for i in tqdm.trange(args.steps):
+    for i in tqdm.trange(cfg.steps):
         guess = warm_guess(sc.reference_guess(i), prev_u)
-        res = ctrl.solve(
-            x_hat, guess, p_ref=p_ref, weight=HYBRID_WEIGHT
-        )  # acts on estimate
+        res = ctrl.solve(x_hat, guess, p_ref=p_ref, weight=weight)  # acts on estimate
         prev_u = res.u
         u = res.u[0].copy()
         u[4:] += rng.normal(0, np.sqrt(input_var[4:]))
@@ -708,25 +652,26 @@ def run_closed_loop(sc, args, lo, hi, *, hybrid):
         t += dt
 
     out = {k: np.array(v) for k, v in rec.items()}
-    warmup = min(20, args.steps // 4)
+    warmup = min(20, cfg.steps // 4)
     label = (
         "HYBRID (balanced cost)" if hybrid else "ESTIMATION (pure obs, #8 pathology)"
     )
     print(f"=== RT-OAC quadrotor {label} -- ESEKF, controller on estimate ===")
     print(
-        f"steps {args.steps} | rel-pos error final {out['err'][-1]:.2f} m, max {out['err'].max():.2f} m"
+        f"steps {cfg.steps} | rel-pos error final {out['err'][-1]:.2f} m, max {out['err'].max():.2f} m"
         f" | median plan {np.median(out['walls'][1:]):.0f} ms"
     )
     print(
         f"NEES median (after step {warmup}) {np.median(out['nees'][warmup:]):.1f} (E=9) | "
         f"distance [{out['dist'].min():.2f}, {out['dist'].max():.2f}] m (band [{lo:.1f}, {hi:.1f}])"
     )
-    plot_hybrid(out, dt, lo, hi, args.steps, mode, hybrid)
-    if not args.spawn:
+    standoff = np.asarray(cfg.mode.standoff[0:3]) if hybrid else None
+    plot_hybrid(out, dt, lo, hi, cfg.steps, mode, hybrid, standoff)
+    if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
 
-def plot_hybrid(rec, dt, lo, hi, steps, mode, hybrid):
+def plot_hybrid(rec, dt, lo, hi, steps, mode, hybrid, standoff):
     tt = np.arange(steps) * dt
     dof = 9
     fig = plt.figure(figsize=(16, 9))
@@ -776,9 +721,14 @@ def plot_hybrid(rec, dt, lo, hi, steps, mode, hybrid):
     s = ax.scatter(
         rec["rel"][:, 0], rec["rel"][:, 1], rec["rel"][:, 2], c=tt, cmap="viridis", s=8
     )
-    ax.scatter(*HYBRID_STANDOFF[0:3], marker="*", c="black", s=160, label="standoff")
+    extra = rec["rel"]
+    if (
+        standoff is not None
+    ):  # hybrid: mark the standoff set-point (none in pure-obs estimation)
+        ax.scatter(*standoff, marker="*", c="black", s=160, label="standoff")
+        extra = np.vstack([rec["rel"], standoff])
     fig.colorbar(s, ax=ax, pad=0.12, label="t [s]", shrink=0.6)
-    _equal_3d(ax, np.vstack([rec["rel"], HYBRID_STANDOFF[0:3]]))
+    _equal_3d(ax, extra)
     ax.set(
         title="Follower in leader-relative frame",
         xlabel="x [m]",

@@ -12,7 +12,9 @@ the real-time method, smarter estimation, experiments, and findings.
 `examples/simple_robot_cooperative_navigation.py`. Both stream a live **rerun**
 visualization (3D/2D scene + trajectories + per-tick observability, plan-time, and
 inter-vehicle-distance time-series) and render a comprehensive multi-panel matplotlib
-figure afterwards. Run with `--spawn` for the live viewer, or headless (default) to write a
+figure afterwards. Config is **Hydra** (`examples/conf/`): the quadrotor's `mode` group is a
+pedagogical arc through finding #8 (`mode=open|estimation|hybrid`); other knobs are overrides
+(`soft=true`, `spawn=true` for the live viewer, `steps=...`). Headless (default) writes a
 `.rrd` recording (open later with `rerun results/example_*.rrd`) plus `results/example_*.png`.
 Status & findings: **`PROGRESS.md`** (+ `results/RESULTS.md`, `results/phase0_findings.md`,
 `results/report.tex`).

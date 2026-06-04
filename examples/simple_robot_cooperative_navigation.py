@@ -20,28 +20,30 @@ plus live time-series of the OAC-vs-no-OAC estimation error, the accumulated obs
 the solve time, and the inter-robot distance. A comprehensive multi-panel matplotlib figure
 is rendered after the run.
 
-Toggles: ``--hybrid`` swaps the log-det OAC for the balanced cost (observability + formation
-standoff, PROGRESS section 7); ``--soft`` enforces the inter-robot distance band as a smooth
-penalty + unconstrained L-BFGS-B instead of the hard SLSQP constraint (faster, JIT-able). Both
-work here (and compose), unlike the quadrotor hybrid, which needs the hard constraint.
+Config is **Hydra** (conf/planar.yaml). ``hybrid=true`` swaps the log-det OAC for the balanced
+cost (observability + formation standoff, PROGRESS section 7); ``soft=true`` enforces the
+inter-robot distance band as a smooth penalty + unconstrained L-BFGS-B instead of the hard
+SLSQP constraint (faster, JIT-able). Both work here (and compose), unlike the quadrotor hybrid,
+which needs the hard constraint. (The planar is inherently estimation-in-the-loop: a carried
+EKF is its defining feature, so there is no feedback mode group.)
 
-Live viewer:    uv run python examples/simple_robot_cooperative_navigation.py --spawn
-Headless (default; writes results/example_planar.rrd + .png):
-                uv run python examples/simple_robot_cooperative_navigation.py [--hybrid] [--soft]
+Live viewer:  uv run python examples/simple_robot_cooperative_navigation.py spawn=true
+Headless:     uv run python examples/simple_robot_cooperative_navigation.py [hybrid=true] [soft=true]
 """
 
-import argparse
 import functools
 import pathlib
 
 from example_lib.misc import simple_ekf
 from example_lib.models import leader_follower_robots as mdl
 from example_lib.visualization import visualization as viz
+import hydra
 import jax
 import jax.numpy as jnp
 import matplotlib as mpl
 import numpy as np
 from observability_aware_control import integrator, observability_cost
+from omegaconf import DictConfig
 import rerun as rr
 import rerun.blueprint as rrb
 import tqdm
@@ -321,45 +323,29 @@ def send_blueprint():
     )
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--spawn", action="store_true", help="launch the live rerun viewer")
-    ap.add_argument("--save", type=str, default=None, help="record to this .rrd path")
-    ap.add_argument(
-        "--hybrid",
-        action="store_true",
-        help="OAC = balanced cost (observability + formation standoff), not pure log-det",
-    )
-    ap.add_argument(
-        "--soft",
-        action="store_true",
-        help="enforce the distance band as a soft penalty + unconstrained L-BFGS-B solve",
-    )
-    args = ap.parse_args()
-
+@hydra.main(version_base=None, config_path="conf", config_name="planar")
+def main(cfg: DictConfig):
     ctrl, cost = (
-        build_hybrid_controller(args.soft)
-        if args.hybrid
-        else build_controller(args.soft)
+        build_hybrid_controller(cfg.soft) if cfg.hybrid else build_controller(cfg.soft)
     )
     gram = jax.jit(
         lambda x, u: cost(x, jnp.asarray(u), STLOG_DT, return_gramians=True).gramians
     )
 
-    rr.init("rt_oac_planar", spawn=args.spawn)
-    suffix = "_hybrid" if args.hybrid else ""
-    rrd = args.save or str(RESULTS / f"example_planar{suffix}.rrd")
-    if not args.spawn:
+    rr.init("rt_oac_planar", spawn=cfg.spawn)
+    suffix = "_hybrid" if cfg.hybrid else ""
+    rrd = cfg.save or str(RESULTS / f"example_planar{suffix}.rrd")
+    if not cfg.spawn:
         rr.save(rrd)
     style_series()
     send_blueprint()
 
     # no-OAC first (cheap, no solve) so its error can be overlaid on the live OAC run
     noac = run(False, ctrl, gram, stream=False)
-    oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"], hybrid=args.hybrid)
+    oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"], hybrid=cfg.hybrid)
 
-    summarize_and_plot(oac, noac, hybrid=args.hybrid)
-    if not args.spawn:
+    summarize_and_plot(oac, noac, hybrid=cfg.hybrid)
+    if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
 

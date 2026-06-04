@@ -1,0 +1,6 @@
+# Open-loop planner: perfect state feedback, the soft-min observability orbit.
+name: open
+feedback: perfect
+objective: softmin
+band: [1.0, 2.0] # constant-radius orbit band
+default_steps: 300

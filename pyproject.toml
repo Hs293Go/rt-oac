@@ -23,6 +23,7 @@ dependencies = [
   # editable install exposes BOTH its packages (observability_aware_control and
   # example_lib), so they import without any sys.path/PYTHONPATH bootstrap.
   "observability_aware_control",
+  "hydra-core>=1.3.2",
 ]
 
 [build-system]

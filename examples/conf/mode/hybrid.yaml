@@ -1,0 +1,12 @@
+# Resolved closed loop: estimation in the loop + the golden balanced cost (velocity-damped
+# standoff anchor). Keeps the loop bounded and the estimator near-consistent.
+name: hybrid
+feedback: estimate
+objective: balanced
+band: [0.5, 1.2]
+default_steps: 120
+# velocity-damped standoff anchor (relative position -> standoff AND relative velocity -> 0):
+standoff: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+pos_idx: [0, 1, 2, 7, 8, 9] # relative position + relative velocity blocks
+rho: 0.5 # tracking scale (s_track = rho^2 * window)
+weight: 1.0 # dimensionless observability weight in the normalized balance

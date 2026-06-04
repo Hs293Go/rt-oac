@@ -1,0 +1,22 @@
+# RT-OAC quadrotor headline -- Hydra config. The `mode` group bundles feedback/objective/band/
+# horizon so the three-mode arc (open -> estimation -> hybrid) is selected by one key, not a
+# tangle of flags. Override on the CLI, e.g.:
+#   uv run python examples/quadrotor_cooperative_navigation.py mode=hybrid
+#   uv run python examples/quadrotor_cooperative_navigation.py mode=estimation steps=120
+#   uv run python examples/quadrotor_cooperative_navigation.py mode=open soft=true spawn=true
+defaults:
+  - mode: open # open | estimation | hybrid  (see conf/mode/)
+  - override hydra/job_logging: disabled # no <script>.log in cwd
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+steps: null # null -> mode.default_steps
+spawn: false # launch the live rerun viewer
+save: null # record the .rrd to this path (else results/example_quadrotor[_mode].rrd)
+soft: false # distance band as a soft penalty + unconstrained L-BFGS-B (vs hard SLSQP)
+leader_speed: 2.0 # open-loop world-frame cruise (Galilean-invariant; ignored under feedback)
+
+hydra:
+  run: { dir: . }
+  output_subdir: null
+  job: { chdir: false }

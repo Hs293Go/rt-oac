@@ -25,6 +25,12 @@ results/**/*.fls
 results/**/*.log
 results/**/*.out
 
+# Hydra: job logging is disabled in the example configs, but guard against an override that
+# re-enables it dumping <script>.log / a per-run dir in the repo root.
+*.log
+outputs/
+multirun/
+
 # Editor
 .vscode/
 .idea/

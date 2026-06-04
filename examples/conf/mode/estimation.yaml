@@ -1,0 +1,6 @@
+# Estimation in the loop, pure observability (no anchor): demonstrates finding #8 (diverges).
+name: estimation
+feedback: estimate
+objective: softmin
+band: [0.5, 1.2] # the aggressive #8 regime
+default_steps: 120

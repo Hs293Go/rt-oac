@@ -1,0 +1,19 @@
+# RT-OAC planar headline -- Hydra config. The planar example is *inherently*
+# estimation-in-the-loop (a carried EKF is its defining feature), so there is no feedback mode
+# group -- just the two toggles. Override on the CLI, e.g.:
+#   uv run python examples/simple_robot_cooperative_navigation.py hybrid=true
+#   uv run python examples/simple_robot_cooperative_navigation.py soft=true spawn=true
+defaults:
+  - override hydra/job_logging: disabled # no <script>.log in cwd
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+hybrid: false # OAC = balanced cost (observability + formation standoff) vs pure log-det
+soft: false # distance band as a soft penalty + unconstrained L-BFGS-B (vs hard SLSQP)
+spawn: false # launch the live rerun viewer
+save: null # record the .rrd to this path (else results/example_planar[_hybrid].rrd)
+
+hydra:
+  run: { dir: . }
+  output_subdir: null
+  job: { chdir: false }
