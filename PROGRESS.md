@@ -162,6 +162,27 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     near truth** + the formation anchor, NOT genuine localization. A faithful posterior needs a
     non-Gaussian filter (PF) — but RBPF is ~20× over budget. Reproduce:
     `mode=estimation filter={ekf,ukf} plan_on_truth=true report=/tmp/x` then inspect `sig`.
+15. **[2026-06-04] VERDICT — no deployable carried loop exists yet; the scheduled EKF-hybrid is
+    seed-fragile.** The 16-seed sweep of the prior "golden" loop (`mode=hybrid filter=ekf`, the
+    covariance+innovation dual-control schedule) gives errmax **median 3.6 m, only 19% bounded
+    (<1.5 m), 50% limping [1.5, 5 m), 31% diverged (>5 m)** — seed 0's 1.21 m was luck. The UKF
+    hybrid diverges on **100%** of seeds (median 28 m). This confirms finding #9 survives the
+    dual-control schedule and closes the question the report deferred: the carried closed-loop OAC is
+    **genuinely open**, and headlining only timing + soft constraint was correct.
+    **Root-cause synthesis (#8→#15):** range-only relative localization is structurally weakly
+    observable in the tangential subspace (observable only at high Lie order r*≥5; a single range
+    pins radial only). The recursive posterior is a thin ridge no Gaussian filter calibrates — the
+    EKF collapses it (overconfident, but its stiff mean coincidentally stays near truth, which is the
+    *only* reason any seed is bounded), the UKF inflates it (P_pos grows unbounded). Closing the
+    control loop around that miscalibrated mean diverges, and no scalar covariance→weight schedule
+    fixes it. **Three genuinely-open paths (none is a quick knob):** (a) **robust-to-persistent-
+    uncertainty control** — accept the tangential uncertainty never resolves and keep the follower
+    bounded *given* a permanent tangential error set (tube/min-max MPC); the principled version of the
+    EKF-hybrid's accidental stiffness; (b) a **non-Gaussian filter** (PF/RBPF) to represent the ridge,
+    budget permitting; (c) **reformulate the OA objective** — the STLOG short-time Gramian is full-
+    rank on the orbit yet the recursive filter does not converge (fact #14), so a metric targeting
+    *recursive information accumulation* rather than instantaneous observability (ties to CLAUDE.md's
+    "learn observability metrics from data"). Reproduce: `mode=hybrid filter={ekf,ukf} seed=0,..,15`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
