@@ -12,6 +12,7 @@ hybrid: false # OAC = balanced cost (observability + formation standoff) vs pure
 soft: false # distance band as a soft penalty + unconstrained L-BFGS-B (vs hard SLSQP)
 spawn: false # launch the live rerun viewer
 save: null # record the .rrd to this path (else results/example_planar[_hybrid].rrd)
+report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
 
 hydra:
   run: { dir: . }

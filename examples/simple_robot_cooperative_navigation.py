@@ -49,7 +49,7 @@ import rerun.blueprint as rrb
 import tqdm
 
 import rt_oac  # noqa: F401
-from rt_oac import metrics, tracking_cost
+from rt_oac import metrics, report, tracking_cost
 from rt_oac.balanced_cost import make_balanced
 from rt_oac.controller import RTController
 
@@ -345,6 +345,47 @@ def main(cfg: DictConfig):
     oac = run(True, ctrl, gram, stream=True, noac_err=noac["err"], hybrid=cfg.hybrid)
 
     summarize_and_plot(oac, noac, hybrid=cfg.hybrid)
+    if cfg.report:
+        variant = "hybrid" if cfg.hybrid else "logdet"
+        tag = "planar_" + variant + ("_soft" if cfg.soft else "")
+        arrays = {
+            f"oac_{k}": np.asarray(v)
+            for k, v in oac.items()
+            if k not in {"rmse", "final"}
+        }
+        arrays.update({
+            f"noac_{k}": np.asarray(v)
+            for k, v in noac.items()
+            if k not in {"rmse", "final"}
+        })
+        arrays["t"] = np.arange(STEPS) * DT
+        report.dump(
+            cfg.report,
+            tag,
+            summary={
+                "kind": "planar",
+                "variant": variant,
+                "soft": bool(cfg.soft),
+                "hybrid": bool(cfg.hybrid),
+                "feedback": "estimate",
+                "objective": "balanced" if cfg.hybrid else "logdet",
+                "steps": int(STEPS),
+                "dt": float(DT),
+                "band_lo": float(DIST_BOUNDS[0]),
+                "band_hi": float(DIST_BOUNDS[1]),
+                "oac_rmse_m": float(oac["rmse"]),
+                "oac_final_m": float(oac["final"]),
+                "noac_rmse_m": float(noac["rmse"]),
+                "noac_final_m": float(noac["final"]),
+                "plan_median_ms": float(np.median(oac["walls"][1:])),
+                "plan_tick0_ms": float(oac["walls"][0]),
+                "mineig_median": float(np.median(oac["mineig"])),
+                "dist_min": float(oac["dist"].min()),
+                "dist_max": float(oac["dist"].max()),
+            },
+            arrays=arrays,
+        )
+        print(f"report data -> {cfg.report}/{tag}.{{npz,json}}")
     if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 

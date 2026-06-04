@@ -28,12 +28,15 @@ pedagogical arc through finding #8 (override on the CLI, e.g. ``mode=hybrid``):
     true relative state), the soft-min orbit, the level-cruise leader -- the pretty orbit;
   * ``mode=estimation`` = **estimation in the loop**: the same pure observability, but the
     controller now acts on the ``ErrorStateEKF`` *estimate* -- the orbit *diverges* (finding #8);
-  * ``mode=hybrid`` = the **resolved closed loop**: estimation in the loop + the tracking/
-    observability balanced cost (NormalizedWeightedSum with a velocity-damped standoff anchor,
-    the golden form). Keeps the loop bounded and the estimator near-consistent (error within
-    3-sigma, NEES in/near the chi-square band) -- a partial resolution with a slow residual
-    drift over long horizons.
-See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
+  * ``mode=hybrid`` = an **exploratory, seed-fragile** closed loop: estimation in the loop + a
+    tracking/observability balanced cost (covariance+innovation-scheduled when ``mode.schedule``).
+    On a lucky seed it can hold NEES near the chi-square band, but across seeds it does **not**
+    robustly resolve the carried-estimation coupling (the earlier "resolution" was overfit to one
+    seed). The robust, non-diverging baseline is ``reanchor=true`` -- the paper's validation, which
+    pins the EKF mean to truth each step (so only the covariance envelope propagates).
+Diagnostics: ``reanchor=true`` (mean pinned to truth), ``plan_on_truth=true`` (carry the mean but
+plan on truth) -- the three-way trichotomy that isolates the divergence. See the report
+(report/improving_beginners_oac.tex) and docs/carried_estimation_plan.md.
 
 Visualization is **rerun**: a live 3D scene plus live time-series (open loop: plan time /
 observability / distance; closed loop: error & 3-sigma / NEES / distance / plan time). A
@@ -45,8 +48,9 @@ benchmarks/penalty_solver_probe.py). Great for the open-loop orbit (~85 vs ~115 
 but NOT for ``mode=hybrid`` (the delicate loop destabilizes under it -- keep hard there).
 
 Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [spawn=true] [soft=true]
-Estimation:   uv run python examples/quadrotor_cooperative_navigation.py mode=estimation  (shows #8)
-Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py mode=hybrid      (resolves #8)
+Estimation:   uv run python examples/quadrotor_cooperative_navigation.py mode=estimation  (#8 diverges)
+Paper valid.: uv run python examples/quadrotor_cooperative_navigation.py mode=estimation reanchor=true
+Hybrid (expl):uv run python examples/quadrotor_cooperative_navigation.py mode=hybrid       (seed-fragile)
 """
 
 import dataclasses
@@ -68,7 +72,7 @@ from scipy import stats
 import tqdm
 
 import rt_oac  # noqa: F401
-from rt_oac import metrics, tracking_cost
+from rt_oac import metrics, report, tracking_cost
 from rt_oac.balanced_cost import make_balanced
 from rt_oac.controller import RTController
 from rt_oac.error_state_ekf import ErrorStateEKF
@@ -188,9 +192,19 @@ def main(cfg: DictConfig):
     lo, hi = float(cfg.mode.band[0]), float(cfg.mode.band[1])
     sc = build_scenario(gramian_metric=metrics.neg_softmin_eig)
     if cfg.mode.feedback == "estimate":
-        # Closed-loop modes keep the scenario's default leader -- the config the coupling work
-        # was validated on (drone_coupling_eval.py). The level-cruise override below is open-loop
-        # only; under estimate feedback a fast leader destabilizes the standoff-tracking loop.
+        # Closed-loop modes default to the scenario's (near-stationary min-snap) leader -- the
+        # config the coupling work was validated on (drone_coupling_eval.py). With that leader the
+        # world-frame follower path sits on top of its relative orbit (a near-ego view). Setting
+        # world_leader=true swaps in a level constant-velocity cruise so the world-frame scene is
+        # genuinely absolute (a moving helix). The relative dynamics see only the leader's hover
+        # inputs (f=g, omega=0), so the relative orbit -- and the coupling NEES/error -- are
+        # Galilean-invariant w.r.t. the leader's constant velocity (verified).
+        if cfg.world_leader:
+            n_lead = cfg.steps + sc.window + 1
+            x_leader, u_leader = level_cruise_leader(
+                cfg.leader_speed, n_lead, sc.cfg["sim"]["integrator_dt"]
+            )
+            sc = dataclasses.replace(sc, x_leader=x_leader, u_leader=u_leader)
         run_closed_loop(sc, cfg, lo, hi)
         return
     # Open-loop orbit: replace the near-frozen min-snap leader with a level constant-velocity
@@ -302,7 +316,26 @@ def main(cfg: DictConfig):
         x = renorm(sim(jnp.asarray(x), jnp.asarray(res.u[0]))[0])
         t += dt
 
-    summarize_and_plot(rec, dt, lo, hi, cfg.steps)
+    summary = summarize_and_plot(rec, dt, lo, hi, cfg.steps)
+    if cfg.report:
+        tag = f"quad_{cfg.mode.name}" + ("_soft" if cfg.soft else "")
+        arrays = {k: np.array(v) for k, v in rec.items()}
+        arrays["t"] = np.arange(cfg.steps) * dt
+        report.dump(
+            cfg.report,
+            tag,
+            summary={
+                "kind": "quad",
+                "variant": cfg.mode.name,
+                "soft": bool(cfg.soft),
+                "hybrid": False,
+                "feedback": cfg.mode.feedback,
+                "objective": cfg.mode.objective,
+                **summary,
+            },
+            arrays=arrays,
+        )
+        print(f"report data -> {cfg.report}/{tag}.{{npz,json}}")
     if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
@@ -341,6 +374,20 @@ def summarize_and_plot(rec, dt, lo, hi, steps):
         f"observable directions: median {int(np.median(ndir))}/6 | inter-drone distance "
         f"[{dist.min():.2f}, {dist.max():.2f}] m (bounds [{lo:.0f}, {hi:.0f}])"
     )
+    summary = {
+        "steps": int(steps),
+        "dt": float(dt),
+        "band_lo": float(lo),
+        "band_hi": float(hi),
+        "plan_median_ms": float(np.median(walls[steady])),
+        "plan_p95_ms": float(np.percentile(walls[steady], 95)),
+        "plan_tick0_ms": float(walls[0]),
+        "ndir_median": int(np.median(ndir)),
+        "ndir_full": 6,
+        "mineig_median": float(np.median(mineig)),
+        "dist_min": float(dist.min()),
+        "dist_max": float(dist.max()),
+    }
 
     fig = plt.figure(figsize=(20, 9))
     fig.suptitle(
@@ -455,6 +502,7 @@ def summarize_and_plot(rec, dt, lo, hi, steps):
     out = RESULTS / "example_quadrotor.png"
     fig.savefig(out, dpi=130)
     print(f"wrote {out}")
+    return summary
 
 
 # =============== closed-loop path (--estimation pure obs / --hybrid balanced) =============
@@ -580,7 +628,7 @@ def run_closed_loop(sc, cfg, lo, hi):
     ft_tr = viz.PositionTrace("/sim/follower_true", max_length=cfg.steps)
     fe_viz = viz.PoseReferenceFrame("/sim/follower_est")
 
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(cfg.seed)
     x_true = x0.copy()
     P = np.diag([1.0, 1.0, 1.0, 1e-3, 1e-3, 1e-3, 0.4, 0.4, 0.4])
     delta0 = np.array([0.9, 0.9, 0.4, 0.0, 0.0, 0.0, 0.1, 0.1, 0.0])
@@ -590,11 +638,39 @@ def run_closed_loop(sc, cfg, lo, hi):
         k: []
         for k in ("rel", "lead", "ftrue", "fest", "err", "sig", "nees", "dist", "walls")
     }
+    scheduled = hybrid and bool(cfg.mode.schedule)
+    reanchor = bool(
+        cfg.reanchor
+    )  # reset EKF mean to truth each step (paper validation setup)
+    plan_on_truth = bool(
+        cfg.plan_on_truth
+    )  # perfect-feedback OA traj; EKF passive (diagnostic)
     weight = float(cfg.mode.weight) if hybrid else 1.0
+    if scheduled:
+        s0 = float(cfg.mode.s0)
+        w_min, w_max = float(cfg.mode.w_min), float(cfg.mode.w_max)
+        nis0 = float(cfg.mode.nis0)
     prev_u, t, dof = None, 0.0, 9
+    prev_nis = 0.0  # range-innovation NIS from the previous step (estimator surprise)
     for i in tqdm.trange(cfg.steps):
+        if reanchor:
+            x_hat = (
+                x_true.copy()
+            )  # paper validation: pin the EKF mean to truth (no drift)
+        if scheduled:
+            # Dual control: spend the observability budget only where the estimator can keep up.
+            # Back off on BOTH claimed uncertainty (s = trace(P[pos]), P being the prior step's
+            # posterior) AND estimator surprise (prev_nis). Covariance alone misses a
+            # confident-wrong divergence (P small, true error large); the innovation catches it.
+            s = float(np.trace(P[0:3, 0:3]))
+            weight = float(
+                np.clip(w_max / (1.0 + s / s0 + prev_nis / nis0), w_min, w_max)
+            )
         guess = warm_guess(sc.reference_guess(i), prev_u)
-        res = ctrl.solve(x_hat, guess, p_ref=p_ref, weight=weight)  # acts on estimate
+        x_plan = (
+            x_true if plan_on_truth else x_hat
+        )  # plan on truth (open-loop OA) vs estimate
+        res = ctrl.solve(x_plan, guess, p_ref=p_ref, weight=weight)
         prev_u = res.u
         u = res.u[0].copy()
         u[4:] += rng.normal(0, np.sqrt(input_var[4:]))
@@ -604,6 +680,9 @@ def run_closed_loop(sc, cfg, lo, hi):
         y = np.array(mdl.observation(jnp.asarray(x_true))) + rng.normal(
             0, np.sqrt(obs_var)
         )
+        # Estimator surprise: range-channel innovation NIS at the prior (before the update).
+        nu_range = float(y[0] - np.asarray(mdl.observation(jnp.asarray(x_hat)))[0])
+        prev_nis = nu_range**2 / range_var
         x_hat, P = ekf.update(jnp.asarray(x_hat), jnp.asarray(P), jnp.asarray(y))
         x_hat, P = np.array(x_hat), np.array(P)
 
@@ -667,6 +746,40 @@ def run_closed_loop(sc, cfg, lo, hi):
     )
     standoff = np.asarray(cfg.mode.standoff[0:3]) if hybrid else None
     plot_hybrid(out, dt, lo, hi, cfg.steps, mode, hybrid, standoff)
+    if cfg.report:
+        diag = "_reanchor" if reanchor else ("_planontruth" if plan_on_truth else "")
+        tag = f"quad_{mode}{diag}" + ("_soft" if cfg.soft else "")
+        arrays = {**out, "t": np.arange(cfg.steps) * dt}
+        report.dump(
+            cfg.report,
+            tag,
+            summary={
+                "kind": "quad",
+                "variant": mode,
+                "soft": bool(cfg.soft),
+                "hybrid": hybrid,
+                "reanchor": reanchor,
+                "plan_on_truth": plan_on_truth,
+                "feedback": "estimate",
+                "objective": "balanced" if hybrid else "softmin",
+                "steps": int(cfg.steps),
+                "dt": float(dt),
+                "band_lo": float(lo),
+                "band_hi": float(hi),
+                "nees_dof": dof,
+                "err_final_m": float(out["err"][-1]),
+                "err_max_m": float(out["err"].max()),
+                "err_rmse_m": float(np.sqrt((out["err"] ** 2).mean())),
+                "plan_median_ms": float(np.median(out["walls"][1:])),
+                "nees_median": float(np.median(out["nees"][warmup:])),
+                "in3s": float(np.mean(out["err"] <= out["sig"])),
+                "dist_min": float(out["dist"].min()),
+                "dist_max": float(out["dist"].max()),
+                "diverged": bool(out["err"].max() > 5.0 or out["dist"].max() > 5.0),
+            },
+            arrays=arrays,
+        )
+        print(f"report data -> {cfg.report}/{tag}.{{npz,json}}")
     if not cfg.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 

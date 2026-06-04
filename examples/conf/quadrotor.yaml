@@ -14,7 +14,19 @@ steps: null # null -> mode.default_steps
 spawn: false # launch the live rerun viewer
 save: null # record the .rrd to this path (else results/example_quadrotor[_mode].rrd)
 soft: false # distance band as a soft penalty + unconstrained L-BFGS-B (vs hard SLSQP)
-leader_speed: 2.0 # open-loop world-frame cruise (Galilean-invariant; ignored under feedback)
+leader_speed: 2.0 # world-frame level-cruise speed (Galilean-invariant relative orbit)
+world_leader: true # closed-loop: level-cruise leader -> genuine absolute world-frame scene
+seed: 0 # RNG seed for the closed-loop noise (process/measurement/input)
+# Diagnostics isolating the source of the finding-#8 divergence:
+#   reanchor=true     -- reset the EKF mean to truth each step (the companion/paper validation:
+#                        only the covariance envelope propagates along the fixed OA trajectory;
+#                        the mean never drifts, so it cannot diverge). Control sees ~truth.
+#   plan_on_truth=true -- carry the EKF mean, but plan the control on TRUTH (open-loop OA traj +
+#                        a real carried estimator). Isolates loop-closing from estimator drift.
+#   both false (#8)    -- carry the mean AND plan the control on it (the real closed loop).
+reanchor: false
+plan_on_truth: false
+report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
 
 hydra:
   run: { dir: . }

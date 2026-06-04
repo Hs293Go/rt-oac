@@ -1,0 +1,13 @@
+\begin{tabular}{lrrrr}
+\toprule
+Configuration & RMSE & Final $\|e\|$ & Median solve & $\lambda_{\min}$ \\
+ & [m] & [m] & [ms] & \\
+\midrule
+No-OAC (drive straight) & 0.80 & 0.79 & --- & --- \\
+\midrule
+OAC log-det & 0.24 & 0.16 & 2.7 & 3.27 \\
+OAC log-det, soft & 0.63 & 0.25 & 2.3 & 2.27 \\
+OAC balanced & 0.45 & 0.16 & 0.8 & 0.11 \\
+OAC balanced, soft & 0.51 & 0.17 & 1.5 & 0.16 \\
+\bottomrule
+\end{tabular}

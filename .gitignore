@@ -31,6 +31,16 @@ results/**/*.out
 outputs/
 multirun/
 
+# Report pipeline: generated run data + LaTeX build (regenerate via report/sweep.sh + latexmk).
+# report/figures/ and report/tables/ ARE tracked so the report compiles from a fresh checkout.
+report/data/
+report/improving_beginners_oac.pdf
+report/*.aux
+report/*.fls
+report/*.fdb_latexmk
+report/*.out
+report/*.synctex.gz
+
 # Editor
 .vscode/
 .idea/

@@ -9,4 +9,18 @@ default_steps: 120
 standoff: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 pos_idx: [0, 1, 2, 7, 8, 9] # relative position + relative velocity blocks
 rho: 0.5 # tracking scale (s_track = rho^2 * window)
-weight: 1.0 # dimensionless observability weight in the normalized balance
+weight: 1.0 # dimensionless observability weight (fixed, used only when schedule=false)
+# Covariance-scheduled (dual-control) weight -- the ROBUST resolution: back off observability
+# when the estimator is uncertain (s = trace(P[pos]) large) so the loop never out-runs the EKF.
+# This removes the fixed-weight loop's fragility (a 6e-5 leader-input change tipped fixed weight
+# from 0.46 to 1.45 m); the schedule is leader-independent and keeps NEES in the chi^2 band with a
+# substantially moving leader. Tuned on the cruising-leader testbed (s0=1.0, w_max=3.0).
+# weight = clip(w_max / (1 + s/s0 + nis/nis0), w_min, w_max), with s = trace(P[pos]) (claimed
+# uncertainty) AND nis = range-innovation^2 / range_var (estimator *surprise*). Covariance alone
+# cannot catch a confident-wrong divergence (P small, true error large); the innovation can, so
+# gating on both is what makes the loop robust across noise seeds and a moving leader.
+schedule: true
+s0: 1.0 # position-covariance-trace scale
+w_min: 0.05 # floor observability weight
+w_max: 3.0 # ceiling observability weight
+nis0: 4.0 # range-innovation NIS scale (expected ~1 when consistent; large => back off)

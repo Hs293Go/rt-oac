@@ -1,0 +1,11 @@
+\begin{tabular}{lllrrrc}
+\toprule
+Setup & EKF mean & Plans on & NEES & NEES & $\|e\|_{\max}$ & Div. \\
+ & & & med. & worst & med.\ [m] & \\
+\midrule
+Re-anchor mean to truth (paper) & truth (pinned) & $\approx$truth & 2 & 2 & 0.36 & -- \\
+Carry mean, plan on truth & carried & truth & 44 & 112 & 1.59 & -- \\
+Carry mean, plan on estimate & carried & estimate & 44 & 941 & 1.58 & \checkmark \\
+\bottomrule
+\end{tabular}
+% chi^2_9 band [2.7, 19.0]; NEES<band = conservative, >>band = divergent
