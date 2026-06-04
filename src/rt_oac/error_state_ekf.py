@@ -310,3 +310,100 @@ class ErrorStateEKF:
         P_next = ikh @ P @ ikh.T + K @ self._obs_cov @ K.T
         P_next = 0.5 * (P_next + P_next.T)
         return x_next, P_next
+
+    # ---- truth pseudo-measurement ("training-wheels" anchor) ----------------------
+    @functools.partial(jax.jit, static_argnames=["self"], donate_argnums=[1, 2])
+    def update_anchor(self, x, P, x_ref, R_anchor):
+        r"""Correct ``(x, P)`` with a full-state pseudo-measurement of ``x_ref``.
+
+        Treats x_ref as a direct (identity-model) observation of the whole state with
+        tangent covariance R_anchor (9x9): innovation nu = x_ref boxminus x (9-vec),
+        H = I, gain K = P (P + R_anchor)^-1, mean x+ = boxplus(x, K nu), and Joseph
+        covariance P+ = (I - K) P (I - K)^T + K R_anchor K^T.
+
+        With R_anchor = P (1 - a)/a the gain is K = a I: move fraction a toward x_ref
+        and shrink P to (1 - a) P. So a -> 1 is a (consistent) hard snap and a -> 0
+        (R_anchor -> inf) is a no-op (carried) -- the annealed "training-wheels" anchor.
+        x_ref is ground truth (incl. the unobservable follower position), so it lives
+        only in simulation: a scaffold, never a deployed loop.
+
+        Parameters
+        ----------
+        x, P : Array
+            Ambient state (size 10) and tangent covariance (9x9).
+        x_ref : Array
+            Reference (truth) ambient state (size 10) to anchor toward.
+        R_anchor : Array
+            Tangent pseudo-measurement covariance (9x9); larger = looser anchor.
+
+        Returns
+        -------
+        tuple[Array, Array]
+            The anchored ``(x^+, P^+)``.
+        """
+        nu = self._boxminus(x_ref, x)  # x_ref boxminus x; H = I on the tangent
+        S = P + R_anchor
+        K = jla.solve(S.T, P).T  # K = P (P + R_anchor)^{-1}
+        x_next = self._manifold.boxplus(x, K @ nu)
+
+        identity = jnp.eye(self._tangent_dim)
+        ikh = identity - K
+        P_next = ikh @ P @ ikh.T + K @ R_anchor @ K.T
+        P_next = 0.5 * (P_next + P_next.T)
+        return x_next, P_next
+
+    # ---- First-Estimates-Jacobian (FEJ) variants ----------------------------------
+    @functools.partial(jax.jit, static_argnames=["self"], donate_argnums=[1, 2])
+    def predict_fej(self, x, P, u, dt, x_lin):
+        r"""Like :meth:`predict`, but evaluate F and G at a FROZEN reference x_lin.
+
+        The mean advances from x; only the transition F and input G are linearized at
+        x_lin (First-Estimates Jacobian), blocking the spurious info gain in the
+        unobservable subspace a re-linearized EKF accrues from a drifting estimate (M0).
+        Reset x_lin periodically. NOTE: for a fully dynamic relative-pose state a static
+        x_lin goes stale fast -- propagate it instead.
+        """
+        x_next = self._step(x, u, dt)
+        x_lin_next = self._step(x_lin, u, dt)
+
+        def err_transition(delta):
+            x_pert = self._manifold.boxplus(x_lin, delta)
+            return self._boxminus(self._step(x_pert, u, dt), x_lin_next)
+
+        def input_map(u_in):
+            return self._boxminus(self._step(x_lin, u_in, dt), x_lin_next)
+
+        zero = jnp.zeros(self._tangent_dim)
+        F = jax.jacobian(err_transition)(zero)
+        G = jax.jacobian(input_map)(u)
+
+        P_next = F @ P @ F.T + G @ self._in_cov @ G.T
+        if self._proc_cov is not None:
+            P_next += self._proc_cov
+        P_next = 0.5 * (P_next + P_next.T)
+        return x_next, P_next
+
+    @functools.partial(jax.jit, static_argnames=["self"], donate_argnums=[1, 2])
+    def update_fej(self, x, P, y, x_lin):
+        r"""Like :meth:`update`, but form the measurement Jacobian H at a FROZEN x_lin.
+
+        The innovation nu = y boxminus h(x) uses the current mean; only H is formed at
+        the first-estimate x_lin (First-Estimates Jacobian).
+        """
+        nu = self._residual(x, y)
+
+        def residual_of_delta(delta):
+            return self._residual(self._manifold.boxplus(x_lin, delta), y)
+
+        zero = jnp.zeros(self._tangent_dim)
+        H = -jax.jacobian(residual_of_delta)(zero)
+
+        S = H @ P @ H.T + self._obs_cov
+        K = jla.solve(S.T, H @ P).T
+
+        x_next = self._manifold.boxplus(x, K @ nu)
+        identity = jnp.eye(self._tangent_dim)
+        ikh = identity - K @ H
+        P_next = ikh @ P @ ikh.T + K @ self._obs_cov @ K.T
+        P_next = 0.5 * (P_next + P_next.T)
+        return x_next, P_next

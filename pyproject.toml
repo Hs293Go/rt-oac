@@ -112,6 +112,10 @@ per-file-ignores = { "tests/**" = [
   # symbols (covariance P, transition F, input map G, measurement H, innovation cov S,
   # gain K) rather than lowercasing them, which would obscure the standard EKF equations.
   "N803", "N806",
+], "src/rt_oac/unscented_kf.py" = [
+  # matrix-convention symbols (P, ...) as in error_state_ekf.py; E501 for the dense
+  # unscented-transform math notation in the docstrings.
+  "N803", "N806", "E501",
 ], "**/__init__.py" = [
   "F401", "F403", "D104",
 ] }

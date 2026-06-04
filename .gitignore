@@ -44,3 +44,6 @@ report/*.synctex.gz
 # Editor
 .vscode/
 .idea/
+
+# Claude Code agent working directory
+.claude/
