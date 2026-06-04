@@ -115,6 +115,32 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     shell exactly but is ~20× over the 100 ms budget (CPU) — overkill for a transient. Liveliness:
     `anchor_anneal_eval.py` now STREAMS per-seed heartbeats + an inactivity watchdog (after an
     88-min invisible hang from a self-matching `pgrep` wait-loop).
+13. **[2026-06-04] The EKF's over-confidence is LOAD-BEARING; honest covariance alone is
+    destabilizing — the schedule rescaling of #12 is not the lever.** Two decisive sweeps refute the
+    "UKF + rescaled dual-control" path #12 proposed:
+    (a) **UKF with the control on TRUTH** (`plan_on_truth`, carry the mean) is bounded and
+    consistent on **16/16 seeds** (pos-NEES **0.1**, errmax 1.35 m), vs the EKF's 8/16 at NEES 40.8
+    (`--filters --pot`). So the UKF is a *correct* filter — the carried divergence is **purely the
+    controller acting on the estimate**, not any filter defect.
+    (b) But swapping the UKF into the **deployable `mode=hybrid`** loop (the golden velocity-damped
+    standoff anchor) **diverges across the entire schedule range** — `s0=1` (formation-only) 21.8 m,
+    `s0=200` (back off harder) 15.8 m — while the EKF hybrid holds at **1.21 m**. Block-NEES stays
+    in band throughout (pos 0.2–1.8): the UKF *honestly* reports the growing uncertainty, so it is
+    "consistent" all the way out to 16 m. The mechanism: the formation anchor faithfully drives the
+    *estimate* to the standoff; the EKF's stiff (frozen, over-confident) mean barely moves, so it
+    pins the true position too, whereas the UKF's honest, responsive mean **wanders in the
+    unobservable tangential subspace** and the controller tracks the phantom. The over-confidence is
+    a load-bearing bug. `commit-don't-replan` (C, `replan_every`) does not rescue it either —
+    `replan_every=4` on the UKF still diverges (10.5 m): a stale OA horizon executed open-loop on a
+    wrong estimate just flies the follower out faster.
+    **Implication (supersedes #12's path):** the tangential position is *structurally* unobservable
+    from a single range until motion makes it observable (STLOG r*≥5), so no controller can pin it
+    on the bare mean while un-localized. The deployable design must (i) keep the follower bounded by
+    a **fixed / dithered excitation that does NOT track the estimate's absolute position** while
+    un-localized, then (ii) hand off to formation-keeping once the estimate has *earned* trust —
+    gauged by the **UKF's honest `trace(P_pos)`** crossing a threshold (the EKF can't gate this: it
+    always claims localized). The UKF's value is this trustworthy convergence gauge, not a drop-in
+    stabilizer. M3 is now precisely specified as this dither-until-localized → formation handoff.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,

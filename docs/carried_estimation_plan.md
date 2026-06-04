@@ -61,6 +61,19 @@ Established facts:
    #8 is triggered by aggressive observability-seeking on a not-yet-converged (position-overconfident)
    estimate. The truth anchor is a sim-only scaffold — the deployable task is to *cross the same
    transient without truth*.
+8. **[2026-06-04] The EKF's over-confidence is LOAD-BEARING; an honest covariance alone is
+   destabilizing.** (a) With the control on TRUTH (`plan_on_truth`), the **UKF** is bounded +
+   consistent on 16/16 seeds (pos-NEES 0.1) vs the EKF's 8/16 — so the UKF is a *correct* filter and
+   the carried divergence is purely the controller-on-estimate coupling. (b) But in the deployable
+   `mode=hybrid` loop the UKF **diverges across the whole schedule** (`s0`=1→200: 21.8→15.8 m, block-
+   NEES in band the whole way) while the EKF holds at 1.21 m: the formation anchor drives the
+   *estimate* to the standoff, and the EKF's stiff/frozen mean coincidentally pins truth whereas the
+   UKF's responsive mean wanders in the unobservable tangential subspace. `commit-don't-replan`
+   (`replan_every=4`) does not rescue it (10.5 m). **Consequence:** honest covariance is necessary as
+   a *convergence gauge*, not sufficient as a stabilizer; the #12 "rescale the dual-control gate"
+   path is refuted, and M3 is respecified (dither-until-localized → formation handoff). Reproduce:
+   `quadrotor_cooperative_navigation.py mode=hybrid filter={ekf,ukf} [mode.s0=200] [replan_every=4]`
+   and `anchor_anneal_eval.py --filters --pot`.
 
 ## 3. Root-cause hypotheses (H1 confirmed by M0/M1)
 
@@ -133,13 +146,21 @@ truth**, not to fight a steady-state instability (so D is likely unnecessary).
    in position during the transient: process-noise inflation on the position block / adaptive Q /
    observability-constrained update. Validate per-block NEES in band under `plan_on_truth` (≥20
    seeds). This directly attacks the cause M0 found.
-4. **M3 — deployable "soft start" (the truth-free cousin of the wheels).** Defer aggressive
-   observability-seeking until the filter has *earned* it, gauged by an observable proxy for
-   convergence — covariance trace and/or a **windowed** innovation/NIS statistic (B), not truth.
-   Start formation-dominant (or low observability weight), ramp up as the proxy says the estimate
-   has converged. This crosses the M1 transient without an anchor. Target ≥95% of ≥20 seeds bounded,
-   wheels off.
-5. **D** (belief-space / robust MPC) only if M2+M3 plateau — now unlikely given the transient verdict.
+4. **M3 — deployable handoff, RESPECIFIED by fact #8 (the load-bearing-overconfidence result).**
+   The original "start formation-dominant, ramp observability" plan is **refuted**: with the honest
+   UKF the *formation anchor itself* tracks the wandering mean and diverges across the whole schedule
+   range (`s0`=1→200, 21.8→15.8 m), while the over-confident EKF's stiff mean coincidentally holds
+   (1.21 m). The tangential position is structurally unobservable on the bare mean until motion makes
+   it observable, so the controller must NOT drive the follower on the estimate's absolute position
+   while un-localized. Respecified design: **(i) bounded/dithered excitation that does not track the
+   estimate's absolute position** (E, fixed body-frame pattern) until **(ii)** the **UKF's honest
+   `trace(P_pos)`** crosses a localized threshold, then **hand off to formation-keeping** on the
+   now-trustworthy estimate. The UKF is the convergence *gauge* (the EKF always claims localized and
+   cannot gate this), not a drop-in stabilizer. Target ≥95% of ≥20 seeds bounded, wheels off.
+5. **D** (belief-space / robust MPC) only if M2+M3 plateau. The fact-#8 result (a mean-tracking
+   controller is destabilized by an *honest* covariance) raises D's likelihood vs the earlier
+   transient-only reading: planning on the covariance (not the bare mean) may be the principled cure
+   if the M3 dither-handoff proves brittle.
 6. **Learning curriculum** — well-enabled: the across-rollout truth-anchor anneal reliably produces
    non-divergent rollouts (fact #7), the expert/data a learned policy needs.
 
