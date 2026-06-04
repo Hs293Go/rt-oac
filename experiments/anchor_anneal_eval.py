@@ -212,13 +212,18 @@ def m2_consistency_sweep(seeds, steps):
     )
 
 
-def filter_compare(seeds, steps):
-    print("\n=== EKF vs UKF: carried loop, per-block NEES + robustness ===")
+def filter_compare(seeds, steps, pot=False):
+    src = "control on TRUTH (plan_on_truth)" if pot else "carried closed loop"
+    extra = ["plan_on_truth=true"] if pot else []
+    print(f"\n=== EKF vs UKF: {src}, per-block NEES + robustness ===")
     print(
         f"{'filter':<12}{'pos-NEES':>10}{'rot-NEES':>10}{'errmax(med)':>13}"
         f"{'bounded':>9}{'diverged':>10}"
     )
-    for label, flags in [("EKF", ["filter=ekf"]), ("UKF", ["filter=ukf"])]:
+    for label, flags in [
+        ("EKF", ["filter=ekf", *extra]),
+        ("UKF", ["filter=ukf", *extra]),
+    ]:
         r = sweep(flags, seeds, steps, label=label)
         block = np.array(r["block"]) if r["block"] else np.empty((0, 3))
         errmax = np.array(r["errmax"])
@@ -245,13 +250,16 @@ def main():
     ap.add_argument(
         "--filters", action="store_true", help="run only the EKF-vs-UKF compare"
     )
+    ap.add_argument(
+        "--pot", action="store_true", help="filters: plan on truth (vs carried)"
+    )
     args = ap.parse_args()
     print(f"anchor anneal eval: {args.seeds} seeds, {args.steps} steps, moving leader")
     if args.m2:
         m2_consistency_sweep(args.seeds, args.steps)
         return
     if args.filters:
-        filter_compare(args.seeds, args.steps)
+        filter_compare(args.seeds, args.steps, pot=args.pot)
         return
     consistency_audit(args.seeds, args.steps)
     anneal_discriminator(args.seeds, args.steps)
