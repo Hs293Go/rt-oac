@@ -209,6 +209,22 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     can actually push the PCRB below the formation scale (i.e. the OA orbit is not already PCRB-optimal).
     Reproduce: `examples/...quadrotor... mode=estimation filter=ukf plan_on_truth=true report=/tmp/derisk`
     then `experiments/fim_diagnostic.py --npz /tmp/derisk/quad_estimation_planontruth.npz`.
+17. **[2026-06-04] Phase B headroom de-risk: PCRB-targeted orbit shaping IS worth it — ~2.3–2.9×
+    tighter localization while holding formation.** `experiments/pcrb_optimize.py` is a self-contained
+    differentiable optimizer: decision vars = the follower's N×4 input sequence (leader fixed),
+    forward = integrate the relative dynamics → run the EKF Riccati at truth (F/G/H reused from the
+    ESEKF) → per-step trace(P[pos]); objective = mean steady-state trace(P[pos]) + a soft
+    standoff-band penalty (so it can't cheat by flying out to a huge parallax). JAX value_and_grad +
+    scipy L-BFGS-B. Result (N=30): the recursive PCRB 3σ_pos drops **3.6 m (STLOG) → 1.61 m** with the
+    band HELD (dist [0.43, 1.20], violation ~3e-4) — ~2.3× tighter than the STLOG orbit, 2.9× tighter
+    than the naive reference. So the answer to the #16 caveat is YES: the STLOG-volume objective leaves
+    real recursive localizability on the table; a PCRB-aware objective recovers it. Note the optimizer
+    drives to the *inner* band edge (tighter standoff = larger parallax-per-range = more observable) —
+    an explicit observability↔formation trade-off. Caveats/next: (i) 1.6 m 3σ is still ~0.5 m std (~half
+    the standoff) — better than 3.6 m but maybe not yet tight enough to bound the carried loop (Phase C
+    decides); (ii) the Riccati-in-the-objective is nested autodiff (2nd-order) — a real-time concern for
+    wiring into RTController, so Phase B should also try the cheaper accumulated-`W_o` min-eig surrogate
+    (no per-step inverse). Reproduce: `experiments/pcrb_optimize.py --steps 30 --iters 80`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
