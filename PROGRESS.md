@@ -141,6 +141,27 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     gauged by the **UKF's honest `trace(P_pos)`** crossing a threshold (the EKF can't gate this: it
     always claims localized). The UKF's value is this trustworthy convergence gauge, not a drop-in
     stabilizer. M3 is now precisely specified as this dither-until-localized → formation handoff.
+    **(Update — see #14: the P_pos gauge this proposed is itself refuted; the UKF's P_pos never
+    drops. Read #14 before acting on #13's design.)**
+14. **[2026-06-04] De-risk that kills the P_pos gauge: under *perfect* excitation the tangential
+    uncertainty does NOT shrink — there is no calibrated covariance to gate on.** Ran both filters as
+    passive observers on the SAME truth-planned OA orbit (`plan_on_truth`, seed 0, the true error
+    held at ~1.2 m the whole time) and logged 3σ_pos (`report=` dump, `sig` series):
+    - **UKF 3σ_pos GROWS monotonically 2.8 → 4.6 → 8.6 → 15.3 → 23.7 m** while the true error stays
+      1.2 m (end err/σ = 0.05, wildly *under*-confident). A single range is too weak to constrain the
+      tangential direction recursively, so process noise inflates P_pos without bound — even though
+      the STLOG Gramian is full-rank (instantaneously observable ≠ recursively informative).
+    - **EKF 3σ_pos stays ~1.5 m** (end err/σ = 0.92) but NEES median 93 — it *manufactures* tangential
+      certainty (over-confident through the run).
+    So forcing a Gaussian onto the weakly-observable thin-ridge posterior has exactly two failure
+    modes — EKF collapses it, UKF inflates it — and **neither is calibrated**. Consequences:
+    (1) the M3 handoff gauge (#13: "wait for trace(P_pos) to cross low") is **dead** — UKF P_pos
+    never drops, EKF P_pos is a lie; (2) naive covariance-aware/belief-space control is harder than
+    thought (no trustworthy P to plan against — the UKF's is too pessimistic, the EKF's too
+    optimistic); (3) what keeps the deployable EKF-hybrid bounded is the EKF's **stiff mean staying
+    near truth** + the formation anchor, NOT genuine localization. A faithful posterior needs a
+    non-Gaussian filter (PF) — but RBPF is ~20× over budget. Reproduce:
+    `mode=estimation filter={ekf,ukf} plan_on_truth=true report=/tmp/x` then inspect `sig`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
