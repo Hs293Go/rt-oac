@@ -42,6 +42,11 @@ p_pos_floor: 0.0
 fej: false
 fej_epoch: 15
 filter: ekf # closed-loop estimator: ekf (ErrorStateEKF) | ukf (manifold UKF, derivative-free)
+# Commit-don't-replan (approach C): re-solve the OAC NLP only every `replan_every` steps and
+# execute the committed input horizon open-loop in between, so the controller stops re-chasing the
+# (responsive) carried estimate every tick -- the diagnosed source of the carried-loop wander --
+# and amortizes the solve cost. 1 = re-solve every step (the current closed loop).
+replan_every: 1
 report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
 
 hydra:

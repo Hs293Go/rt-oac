@@ -698,7 +698,13 @@ def run_closed_loop(sc, cfg, lo, hi):
         s0 = float(cfg.mode.s0)
         w_min, w_max = float(cfg.mode.w_min), float(cfg.mode.w_max)
         nis0 = float(cfg.mode.nis0)
+    replan_every = max(1, int(cfg.replan_every))  # C: re-solve period (1 = every step)
     prev_u, t, dof = None, 0.0, 9
+    plan_u, commit_k, solve_wall = (
+        None,
+        0,
+        0.0,
+    )  # committed input horizon + index into it
     prev_nis = 0.0  # range-innovation NIS from the previous step (estimator surprise)
     for i in tqdm.trange(cfg.steps):
         if reanchor:
@@ -714,13 +720,23 @@ def run_closed_loop(sc, cfg, lo, hi):
             weight = float(
                 np.clip(w_max / (1.0 + s / s0 + prev_nis / nis0), w_min, w_max)
             )
-        guess = warm_guess(sc.reference_guess(i), prev_u)
-        x_plan = (
-            x_true if plan_on_truth else x_hat
-        )  # plan on truth (open-loop OA) vs estimate
-        res = ctrl.solve(x_plan, guess, p_ref=p_ref, weight=weight)
-        prev_u = res.u
-        u = res.u[0].copy()
+        # Commit-don't-replan (C): re-solve only every `replan_every` steps; execute the committed
+        # input horizon open-loop in between. Re-solve when the period elapses or the committed plan
+        # is exhausted (commit index past the horizon).
+        if plan_u is None or commit_k >= len(plan_u) or i % replan_every == 0:
+            guess = warm_guess(sc.reference_guess(i), prev_u)
+            x_plan = (
+                x_true if plan_on_truth else x_hat
+            )  # plan on truth (open-loop OA) vs estimate
+            res = ctrl.solve(x_plan, guess, p_ref=p_ref, weight=weight)
+            prev_u, plan_u, commit_k = res.u, res.u, 0
+            solve_wall = res.wall_time
+        else:
+            solve_wall = (
+                0.0  # reuse step: no solve cost (the timing benefit of committing)
+            )
+        u = plan_u[commit_k].copy()
+        commit_k += 1
         u[4:] += rng.normal(0, np.sqrt(input_var[4:]))
         if fej and i % fej_epoch == 0:
             x_lin = (
@@ -790,7 +806,7 @@ def run_closed_loop(sc, cfg, lo, hi):
             ("sig", sig),
             ("nees", nees),
             ("dist", dist),
-            ("walls", res.wall_time * 1e3),
+            ("walls", solve_wall * 1e3),
             ("nees_pos", bnees["pos"]),
             ("nees_rot", bnees["rot"]),
             ("nees_vel", bnees["vel"]),
@@ -813,7 +829,7 @@ def run_closed_loop(sc, cfg, lo, hi):
         rr.log("/graphs/nees/val", rr.Scalars(nees))
         rr.log("/graphs/nees/exp", rr.Scalars(float(dof)))
         rr.log("/graphs/distance/dist", rr.Scalars(dist))
-        rr.log("/graphs/solve/ms", rr.Scalars(res.wall_time * 1e3))
+        rr.log("/graphs/solve/ms", rr.Scalars(solve_wall * 1e3))
         t += dt
 
     out = {k: np.array(v) for k, v in rec.items()}
