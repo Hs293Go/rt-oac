@@ -114,14 +114,17 @@ frames, covariance ellipse, range) plus per-tick time-series (observability, pla
 estimation error) and render a comprehensive multi-panel matplotlib figure afterwards. Run
 `--spawn` for the live viewer or headless (default) for a `.rrd` + `.png`.
 
-A `--hybrid` toggle activates the tracking/observability hybridization (the §7 golden form —
-NormalizedWeightedSum with a velocity-damped standoff anchor) **and the closed-loop estimator**:
-the quadrotor switches from the open-loop soft-min orbit to the ESEKF estimate-feedback loop
-that resolves #8 (bounded, estimator near-consistent — NEES in the χ² band at ~80 steps, ~22 just
-above it by 120 as the slow drift sets in); the planar swaps its log-det OAC for the balanced
-cost. The hybrid quadrotor runs against the as-validated (default) leader — the
-level-cruise override is open-loop only, since under estimate feedback a fast leader destabilizes
-the standoff-tracking loop.
+The quadrotor example is a **three-mode pedagogical arc through #8**: default = open-loop soft-min
+orbit (perfect feedback, the pretty orbit); `--estimation` = **estimation in the loop** (pure
+observability on the ESEKF estimate) → *diverges* (error 2.93 m, NEES 260, distance escapes the
+band to 6.5 m at 80 steps); `--hybrid` = estimation in the loop + the §7 golden balanced cost
+(velocity-damped standoff anchor) → *resolved* (error 0.46 m, NEES 14.3 in the χ² band, distance
+held — a partial resolution with a slow drift, NEES ~22 by 120 steps). `--soft` (any open-loop
+mode) folds the band into the objective for an L-BFGS-B solve; it destabilizes the delicate hybrid
+so stays opt-in. The planar example is *inherently* estimation-in-the-loop (a carried EKF is its
+defining feature); its `--hybrid` swaps log-det OAC for the balanced cost. The hybrid quadrotor
+runs against the as-validated default leader — the level-cruise override is open-loop only, since
+under estimate feedback a fast leader destabilizes the standoff-tracking loop.
 
 Three tuning nuances, each backed by a benchmark:
 - **Quadrotor objective/band → soft-min `[1, 2] m`** (`benchmarks/quad_constraint_sweep.py`).

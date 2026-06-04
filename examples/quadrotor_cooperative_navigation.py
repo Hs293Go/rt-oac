@@ -22,14 +22,16 @@ distance constraint inactive, whereas log-det pins the follower to the max-dista
 (active constraint => costlier SLSQP QP). See ``PROGRESS.md``, ``results/phase0_findings.md``,
 and benchmarks/{objective_solver_profile,objective_eval_microbench}.py.
 
-By default this is the *open-loop planner*: perfect state feedback (the planner sees the true
-relative state), the soft-min orbit, the level-cruise leader. Pure observability under
-*estimate* feedback diverges (PROGRESS.md finding #8) -- so ``--hybrid`` switches to the
-**resolved closed loop**: the tracking/observability balanced cost (NormalizedWeightedSum with
-a velocity-damped standoff anchor, the golden form) + the manifold-aware ``ErrorStateEKF``,
-controller acting on the estimate. The hybrid keeps the loop bounded and the estimator
-near-consistent (error within 3-sigma, NEES in/near the chi-square band) where pure
-observability diverges -- a partial resolution with a slow residual drift over long horizons.
+Three modes -- a pedagogical arc through finding #8:
+  * default = *open-loop planner*: perfect state feedback (the planner sees the true relative
+    state), the soft-min orbit, the level-cruise leader -- the pretty observability orbit;
+  * ``--estimation`` = **estimation in the loop**: the same pure observability, but the
+    controller now acts on the ``ErrorStateEKF`` *estimate* -- the orbit *diverges* (finding #8);
+  * ``--hybrid`` = the **resolved closed loop**: estimation in the loop + the tracking/
+    observability balanced cost (NormalizedWeightedSum with a velocity-damped standoff anchor,
+    the golden form). Keeps the loop bounded and the estimator near-consistent (error within
+    3-sigma, NEES in/near the chi-square band) -- a partial resolution with a slow residual
+    drift over long horizons.
 See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
 
 Visualization is **rerun**, mirroring the companion repo's examples: a live 3D scene plus live
@@ -43,7 +45,8 @@ band held) but NOT for ``--hybrid``: the delicate #8-resolved closed loop destab
 the soft penalty (it was validated only with the hard constraint), so keep hard there.
 
 Open loop:    uv run python examples/quadrotor_cooperative_navigation.py [--spawn] [--soft]
-Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py --hybrid [--spawn]
+Estimation:   uv run python examples/quadrotor_cooperative_navigation.py --estimation   (shows #8)
+Hybrid loop:  uv run python examples/quadrotor_cooperative_navigation.py --hybrid       (resolves #8)
 """
 
 import argparse
@@ -212,9 +215,14 @@ def main():
     ap.add_argument("--spawn", action="store_true", help="launch the live rerun viewer")
     ap.add_argument("--save", type=str, default=None, help="record to this .rrd path")
     ap.add_argument(
+        "--estimation",
+        action="store_true",
+        help="estimation in the loop (ESEKF feedback), pure observability -- demonstrates #8",
+    )
+    ap.add_argument(
         "--hybrid",
         action="store_true",
-        help="tracking/observability balance + closed-loop ESEKF (resolves #8)",
+        help="estimation in the loop + tracking/observability balance (resolves #8)",
     )
     ap.add_argument(
         "--soft",
@@ -222,19 +230,20 @@ def main():
         help="enforce the distance band as a soft penalty + unconstrained L-BFGS-B solve",
     )
     args = ap.parse_args()
-    # Hybrid's #8-resolution is a bounded, near-consistent loop with a slow residual drift, so it
-    # defaults to a shorter validated horizon (120 steps) than the open-loop orbit (300).
+    # The closed-loop (estimation/hybrid) modes default to a shorter validated horizon (120
+    # steps) than the open-loop orbit (300); #8 divergence / its resolution both show by then.
+    closed_loop = args.hybrid or args.estimation
     if args.steps is None:
-        args.steps = 120 if args.hybrid else STEPS
+        args.steps = 120 if closed_loop else STEPS
 
     sc = build_scenario(gramian_metric=metrics.neg_softmin_eig)
     lo, hi = MIN_DIST, MAX_DIST
-    if args.hybrid:
-        # Hybrid keeps the scenario's default leader -- the config the coupling resolution was
-        # validated on (drone_coupling_eval.py). The level-cruise override below is only for the
-        # open-loop pretty-orbit demo; under estimate feedback the standoff anchor must track the
-        # leader, so the closed loop is run against the as-validated leader.
-        run_hybrid(sc, args, lo, hi)
+    if closed_loop:
+        # Closed-loop modes keep the scenario's default leader -- the config the coupling work
+        # was validated on (drone_coupling_eval.py). The level-cruise override below is only for
+        # the open-loop pretty-orbit demo; under estimate feedback a fast leader destabilizes the
+        # standoff-tracking loop, so the closed loop runs against the as-validated leader.
+        run_closed_loop(sc, args, lo, hi, hybrid=args.hybrid)
         return
     # Replace the near-frozen min-snap leader with a level constant-velocity cruise so the
     # world-frame scene covers ground; the relative orbit is unchanged (Galilean invariance).
@@ -500,7 +509,7 @@ def summarize_and_plot(rec, dt, lo, hi, steps):
     print(f"wrote {out}")
 
 
-# ===================== hybrid (--hybrid) closed-loop path =========================
+# =============== closed-loop path (--estimation pure obs / --hybrid balanced) =============
 def _tangent_error(x_hat, x_true):
     """9-vector tangent error x_hat boxminus x_true (manifold-consistent)."""
     diff = x_hat - x_true
@@ -515,11 +524,12 @@ def _tangent_error(x_hat, x_true):
     return np.concatenate([diff[0:3], dtheta, diff[7:10]])
 
 
-def run_hybrid(sc, args, lo, hi):
-    """Tracking/observability balance + closed-loop ESEKF -- the #8-resolved closed loop.
+def run_closed_loop(sc, args, lo, hi, *, hybrid):
+    """Closed-loop ESEKF: the controller acts on the EKF *estimate*, not truth.
 
-    The controller acts on the EKF *estimate* (not truth). Pure observability diverges here;
-    the velocity-damped standoff anchor balanced with observability keeps it bounded and the
+    ``hybrid=False`` (``--estimation``): pure observability (soft-min, no anchor) -- the #8
+    pathology, where the orbit diverges under estimate feedback. ``hybrid=True`` (``--hybrid``):
+    the balanced cost (observability + velocity-damped standoff anchor) keeps it bounded and the
     estimator consistent. See PROGRESS.md section 7 and experiments/drone_coupling_eval.py.
     """
     dt = sc.cfg["sim"]["integrator_dt"]
@@ -532,22 +542,29 @@ def run_hybrid(sc, args, lo, hi):
         quat_z(20),
         [0.0, 1.0, 0.0],
     ])  # at the standoff
-    ref_us = sc.reference_guess(0)
-    s_obs = abs(
-        float(sc.cost(jnp.asarray(x0), jnp.asarray(ref_us), sc.stlog_dt).objective)
-    )
-    track = tracking_cost.quadratic_tracking_cost(
-        position_indices=HYBRID_POS_IDX, w_pos=1.0
-    )
-    bal = make_balanced(
-        sc.cost,
-        track,
-        scheme="normalized",
-        s_track=HYBRID_RHO**2 * sc.window,
-        s_obs=s_obs,
-    )
+    if hybrid:
+        ref_us = sc.reference_guess(0)
+        s_obs = abs(
+            float(sc.cost(jnp.asarray(x0), jnp.asarray(ref_us), sc.stlog_dt).objective)
+        )
+        track = tracking_cost.quadratic_tracking_cost(
+            position_indices=HYBRID_POS_IDX, w_pos=1.0
+        )
+        cost = make_balanced(
+            sc.cost,
+            track,
+            scheme="normalized",
+            s_track=HYBRID_RHO**2 * sc.window,
+            s_obs=s_obs,
+        )
+        p_ref = np.tile(HYBRID_STANDOFF, (sc.window, 1))
+    else:
+        cost, p_ref = (
+            sc.cost,
+            None,
+        )  # --estimation: pure observability (no anchor) -> #8
     ctrl = RTController(
-        bal,
+        cost,
         stlog_dt=sc.stlog_dt,
         lb=np.array(sc.cfg["optim"]["lb"]),
         ub=np.array(sc.cfg["optim"]["ub"]),
@@ -559,7 +576,6 @@ def run_hybrid(sc, args, lo, hi):
         constraint_bounds=(lo**2, hi**2),
         constraint_mode="soft" if args.soft else "hard",
     )
-    p_ref = np.tile(HYBRID_STANDOFF, (sc.window, 1))
 
     range_var, att_var = sc.cfg["noise"]["range_var"], sc.cfg["noise"]["att_var"]
     obs_var = np.concatenate([[range_var], np.full(4, att_var)])
@@ -581,8 +597,9 @@ def run_hybrid(sc, args, lo, hi):
         method=integrator.Methods.EULER,
     )
 
-    rr.init("rt_oac_quadrotor_hybrid", spawn=args.spawn)
-    rrd = args.save or str(RESULTS / "example_quadrotor_hybrid.rrd")
+    mode = "hybrid" if hybrid else "estimation"
+    rr.init(f"rt_oac_quadrotor_{mode}", spawn=args.spawn)
+    rrd = args.save or str(RESULTS / f"example_quadrotor_{mode}.rrd")
     if not args.spawn:
         rr.save(rrd)
     for path, (name, col) in {
@@ -692,9 +709,10 @@ def run_hybrid(sc, args, lo, hi):
 
     out = {k: np.array(v) for k, v in rec.items()}
     warmup = min(20, args.steps // 4)
-    print(
-        "=== RT-OAC quadrotor HYBRID (balanced cost + ESEKF, controller on estimate) ==="
+    label = (
+        "HYBRID (balanced cost)" if hybrid else "ESTIMATION (pure obs, #8 pathology)"
     )
+    print(f"=== RT-OAC quadrotor {label} -- ESEKF, controller on estimate ===")
     print(
         f"steps {args.steps} | rel-pos error final {out['err'][-1]:.2f} m, max {out['err'].max():.2f} m"
         f" | median plan {np.median(out['walls'][1:]):.0f} ms"
@@ -703,18 +721,23 @@ def run_hybrid(sc, args, lo, hi):
         f"NEES median (after step {warmup}) {np.median(out['nees'][warmup:]):.1f} (E=9) | "
         f"distance [{out['dist'].min():.2f}, {out['dist'].max():.2f}] m (band [{lo:.1f}, {hi:.1f}])"
     )
-    plot_hybrid(out, dt, lo, hi, args.steps)
+    plot_hybrid(out, dt, lo, hi, args.steps, mode, hybrid)
     if not args.spawn:
         print(f"rerun recording written; open with:  rerun {rrd}")
 
 
-def plot_hybrid(rec, dt, lo, hi, steps):
+def plot_hybrid(rec, dt, lo, hi, steps, mode, hybrid):
     tt = np.arange(steps) * dt
     dof = 9
     fig = plt.figure(figsize=(16, 9))
     fig.suptitle(
-        "RT-OAC quadrotor HYBRID: balanced cost (obs + velocity-damped standoff) + ESEKF "
-        "estimate feedback -- the #8-resolved closed loop",
+        (
+            "RT-OAC quadrotor HYBRID: balanced cost (obs + velocity-damped standoff) + ESEKF "
+            "-- the #8-resolved closed loop"
+            if hybrid
+            else "RT-OAC quadrotor ESTIMATION: pure observability + ESEKF estimate feedback "
+            "-- the finding-#8 divergence (no anchor)"
+        ),
         fontsize=13,
     )
     ax = fig.add_subplot(2, 3, 1, projection="3d")
@@ -813,7 +836,7 @@ def plot_hybrid(rec, dt, lo, hi, steps):
     ax.legend(fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out = RESULTS / "example_quadrotor_hybrid.png"
+    out = RESULTS / f"example_quadrotor_{mode}.png"
     fig.savefig(out, dpi=130)
     print(f"wrote {out}")
 
