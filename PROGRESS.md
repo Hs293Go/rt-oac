@@ -183,6 +183,32 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     rank on the orbit yet the recursive filter does not converge (fact #14), so a metric targeting
     *recursive information accumulation* rather than instantaneous observability (ties to CLAUDE.md's
     "learn observability metrics from data"). Reproduce: `mode=hybrid filter={ekf,ukf} seed=0,..,15`.
+16. **[2026-06-04] Phase A (objective reformulation, chosen path c): the PCRB diagnostic locates the
+    real bottleneck — recursive position localizability is comparable to the formation scale.**
+    `experiments/fim_diagnostic.py` reconstructs, along the truth-planned OA orbit, the per-node STLOG
+    (the optimizer's metric), the trajectory-accumulated first-order Gramian `W_o = Σ Φ(k,0)ᵀHᵀR⁻¹HΦ`
+    (what the recursive filter actually accumulates), and the **posterior CRLB** (the Riccati at
+    truth with the real Q/R — the floor for ANY recursive filter). Reusing the ESEKF's own F/H/G
+    linearization; the example now dumps `xrel_full`/`u_applied` to feed it. Findings (seed 0):
+    - **Per-node STLOG min-eig ≈ 1e-12** — FLOORED by the `T^(2r*+1)` short-time scaling (r*=5), so the
+      worst direction is numerically singular per node. The log-det/softmin objective therefore
+      optimizes observability *volume*, which loads onto the already-easy attitude/radial directions.
+    - **`W_o` is ill-conditioned (cond 1.7e6); its worst-informed directions are tangential POSITION +
+      VELOCITY** (λ≈40 vs the attitude/radial λ≈1e7). Tangential info *does* accumulate (λ_min ×96 over
+      the run) but stays ~6 orders below the easy directions.
+    - **The decisive number — recursive PCRB 3σ_pos ≈ 3.6 m (≈1.2 m std), vs the ~1 m standoff.** The
+      best *any* recursive filter can localize the follower tangentially is about the size of the
+      formation itself, so the carried controller never has a tight-enough estimate → it wanders. The
+      batch CRLB (x₀, no process noise) is 0.25 m — the info exists but process noise erodes it
+      recursively. The UKF's 23.7 m is ~6× *over* the PCRB floor (over-conservative extraction); the
+      EKF's claimed ~0.5 m is *below* the floor (impossible ⇒ overconfident, NEES 93 — confirmed).
+    **Conclusion:** the STLOG objective fails to drive down the *recursive tangential-position PCRB* —
+    the quantity the control needs. Reformulation target (Phase B): an objective that minimizes the
+    recursive tangential PCRB / maximizes the worst-direction accumulated information *rate against
+    process noise*, not the per-node Gramian volume. Open caveat for Phase C: confirm a different orbit
+    can actually push the PCRB below the formation scale (i.e. the OA orbit is not already PCRB-optimal).
+    Reproduce: `examples/...quadrotor... mode=estimation filter=ukf plan_on_truth=true report=/tmp/derisk`
+    then `experiments/fim_diagnostic.py --npz /tmp/derisk/quad_estimation_planontruth.npz`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,

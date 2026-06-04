@@ -675,6 +675,8 @@ def run_closed_loop(sc, cfg, lo, hi):
             "nees_rot",
             "nees_vel",
             "alpha",
+            "xrel_full",  # full 10-d true relative state (for the FIM/observability diagnostic)
+            "u_applied",  # 8-d applied input (leader + follower)
         )
     }
     scheduled = hybrid and bool(cfg.mode.schedule)
@@ -811,6 +813,8 @@ def run_closed_loop(sc, cfg, lo, hi):
             ("nees_rot", bnees["rot"]),
             ("nees_vel", bnees["vel"]),
             ("alpha", alpha),
+            ("xrel_full", x_true.copy()),
+            ("u_applied", u.copy()),
         ):
             rec[k].append(v)
 
