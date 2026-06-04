@@ -48,8 +48,21 @@ Established facts:
    is robustly observable, so its carried closed loop is stable (8-seed validated). The quadrotor
    relative-pose geometry (indirectly observed velocity, attitude coupling) is the hard case. Use
    the contrast as a controlled comparison.
+6. **[M0, 2026-06-04] The inconsistency is localized to the POSITION block.** Per-sub-block NEES
+   (`experiments/anchor_anneal_eval.py`, 12 seeds, E=3 each): re-anchored (mean correct) pos/rot/vel
+   = 0.6 / 1.1 / 0.0 (consistent-to-conservative); carried = **118 / 5.8 / 0.6** — position is
+   catastrophically over-confident, attitude mildly, velocity fine. H1 confirmed; the lever is the
+   position-covariance scaling, not the whole filter.
+7. **[M1, 2026-06-04] The divergence is a STARTUP TRANSIENT, not steady-state.** Anchoring the EKF
+   mean to truth for the first ~20–40 steps via the annealed pseudo-measurement and then **fully
+   releasing** to carried gives 12/12 seeds bounded, 0 diverged, wheels-off NEES 5–7 (inside the
+   χ²₉ band) — vs pure carried 4/12 bounded, 2 diverged, NEES 122. Sharp release @20, @40, and a
+   gradual wean all succeed. So the carried loop is **locally stable around a converged estimate**;
+   #8 is triggered by aggressive observability-seeking on a not-yet-converged (position-overconfident)
+   estimate. The truth anchor is a sim-only scaffold — the deployable task is to *cross the same
+   transient without truth*.
 
-## 3. Root-cause hypotheses
+## 3. Root-cause hypotheses (H1 confirmed by M0/M1)
 
 - **H1 — estimator inconsistency (primary).** The ESEKF is likely **overconfident** in the weakly
   observable directions: P shrinks faster than the true error, so the controller trusts a bad
@@ -107,13 +120,28 @@ Gate observability-seeking on **estimator surprise**, not claimed uncertainty:
 - Operating point: `r=5, N=20, T=0.2 s, dt=0.05 s`, ESEKF, moving leader. Run env
   `JAX_PLATFORMS=cpu uv run`.
 
-## 6. Sequencing
+## 6. Sequencing (revised by the M0/M1 verdict)
 
-1. **Consistency audit** (A, diagnosis) → is the filter over-confident? Where?
-2. **A** (consistent filter) → re-measure the trichotomy; expect carry-plan-on-truth to recover.
-3. **C** (commit) and **B** (surprise gate) → close the loop; target ≥ 95% bounded.
-4. **D** (belief-space / robust MPC) if A–C plateau.
-5. Only then revisit a learned policy (it needs a non-diverging expert).
+M0/M1 done (facts #6, #7): the inconsistency is in the position block, and the divergence is a
+**startup transient** — crossing it (truth anchor for ~20–40 steps) yields a robustly stable
+carried loop. This sharply narrows the program: the goal is to **cross the same transient without
+truth**, not to fight a steady-state instability (so D is likely unnecessary).
+
+1. ✅ **M0 consistency audit** — position-block over-confidence (fact #6).
+2. ✅ **M1 training-wheels discriminator** — transient verdict (fact #7).
+3. **M2 — position-covariance consistency (A).** Make the carried filter stop being confident-wrong
+   in position during the transient: process-noise inflation on the position block / adaptive Q /
+   observability-constrained update. Validate per-block NEES in band under `plan_on_truth` (≥20
+   seeds). This directly attacks the cause M0 found.
+4. **M3 — deployable "soft start" (the truth-free cousin of the wheels).** Defer aggressive
+   observability-seeking until the filter has *earned* it, gauged by an observable proxy for
+   convergence — covariance trace and/or a **windowed** innovation/NIS statistic (B), not truth.
+   Start formation-dominant (or low observability weight), ramp up as the proxy says the estimate
+   has converged. This crosses the M1 transient without an anchor. Target ≥95% of ≥20 seeds bounded,
+   wheels off.
+5. **D** (belief-space / robust MPC) only if M2+M3 plateau — now unlikely given the transient verdict.
+6. **Learning curriculum** — well-enabled: the across-rollout truth-anchor anneal reliably produces
+   non-divergent rollouts (fact #7), the expert/data a learned policy needs.
 
 ## 7. Success criterion
 

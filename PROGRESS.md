@@ -80,6 +80,41 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
    dynamics are Galilean-invariant — proven). The planar unicycle does not show this (robustly
    observable). Plan: `docs/carried_estimation_plan.md`; write-up:
    `report/improving_beginners_oac.tex` (timing + soft constraint are the solid wins).
+11. **[2026-06-04] #8 is a STARTUP TRANSIENT, localized to the position block — and tractable.**
+    Two experiments (`experiments/anchor_anneal_eval.py`, 12 seeds, moving leader; built on the new
+    annealed truth-anchor `ErrorStateEKF.update_anchor` + `anchor_alpha0/hold/anneal` example
+    flags). **M0 (consistency):** per-block NEES (E=3) is fine when the mean is correct (re-anchored
+    pos/rot/vel = 0.6/1.1/0.0) but the carried filter is catastrophically over-confident in
+    **position** (118 / 5.8 / 0.6). **M1 (training-wheels discriminator):** anchoring the EKF mean
+    to truth for the first ~20–40 steps and then **fully releasing** to carried gives **12/12 seeds
+    bounded, 0 diverged, wheels-off NEES 5–7 (in the χ² band)** vs pure carried (4/12 bounded, 2
+    diverged, NEES 122). So the carried loop is **locally stable around a converged estimate**; the
+    divergence is the startup transient (aggressive observability-seeking on a not-yet-converged,
+    position-over-confident estimate), not a steady-state instability. The truth anchor is a sim-only
+    scaffold; the deployable fix (next) is to cross the same transient **without** truth — position-
+    covariance consistency (M2) + a "soft start" that defers aggressive observability until the
+    filter has converged, gauged by covariance/innovation (M3). Belief-space MPC (D) now likely
+    unneeded. See `docs/carried_estimation_plan.md` §2 facts #6–#7, §6.
+12. **[2026-06-04] The first-order EKF IS the over-confidence culprit — but consistency ≠ stability
+    (the filter↔control coupling).** The position is observable only at HIGHER ORDER (STLOG r*≥5;
+    a single range pins only the radial direction, leaving a non-Gaussian spherical-shell
+    posterior). The first-order EKF's update manufactures tangential certainty the measurement
+    does not provide. A **manifold UKF** (`src/rt_oac/unscented_kf.py`, derivative-free sigma points
+    on R^3×SO(3)×R^3, subclassing the ESEKF; `filter=ukf`) was built and compared head-to-head
+    (`experiments/anchor_anneal_eval.py --filters`, 16 seeds). **UKF fixes the consistency
+    completely and robustly: position-block NEES 195 → 0.6** (E=3) on every seed — confirming the
+    diagnosis. **But the UKF carried loop diverges WORSE (16/16 vs the EKF's 4/16):** an honest
+    (large) P_pos makes the Kalman gain responsive, so the mean wanders in the unobservable
+    tangential direction (errmax ~16 m), while the over-confident EKF was coincidentally stiff.
+    **Lesson: a consistent covariance does not stabilize a loop whose controller plans on the MEAN
+    (covariance-blind).** This explains why the finding-#9 dual-control failed — it keyed on the
+    EKF's P, which *lied*. The honest UKF covariance is the missing **precondition** for
+    covariance-aware control: the deployable path is **UKF + dual-control / soft-start** (back off
+    observability while P_pos is genuinely large), with the gate re-scaled to the UKF's covariance
+    magnitude (its P_pos ~400 vs the EKF's lying ~0.2). A Rao-Blackwellized PF would represent the
+    shell exactly but is ~20× over the 100 ms budget (CPU) — overkill for a transient. Liveliness:
+    `anchor_anneal_eval.py` now STREAMS per-seed heartbeats + an inactivity watchdog (after an
+    88-min invisible hang from a self-matching `pgrep` wait-loop).
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
