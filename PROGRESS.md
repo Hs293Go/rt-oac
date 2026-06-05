@@ -263,6 +263,31 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     Adversarial verdicts: headroom-is-real **SURVIVED** (strict band wband=500/2000 still 1.65–1.74 m,
     viol ≤1e-6; the win is position-only — velocity does not improve); recursive-beats-batch
     **SURVIVED**; strong inner-edge **FAILED**. Reproduce via the sweep workflow / the tool's `--dump`.
+19. **[2026-06-04] REFRAME (per user): the ESTIMATOR is the primary design variable to make OAC/STLOG
+    pay off — and a barometer + the UKF does it.** "First-order objectives won" only because they were
+    scored against a first-order EKF; keep the STLOG observability objective and design the estimator.
+    `experiments/estimator_ladder.py` carries EKF/IEKF/UKF/bootstrap-PF from a wrong prior along a fixed
+    orbit (Monte-Carlo), reporting true position error split radial / tangential / vertical-z.
+    - **Estimator ladder, STLOG orbit, baro OFF (10 seeds):** the **UKF (2nd-order) recovers the
+      tangential (high-order) direction** — RMS 0.38 m vs the EKF's 2.2 m — but its radial blows up
+      (5.3 m). Root cause is finding #14's P_pos inflation: for h=‖r‖² the UKF predicts
+      ‖μ‖²+tr(P_pos), so an over-inflated P pulls ‖μ‖ inward (radial bias). The IEKF (Gauss-Newton MAP,
+      `ErrorStateEKF.update_iterated`) does NOT fix it (over-corrects under the wide prior, 3.07 vs EKF
+      2.49 m). So the high-order tangential observability IS recoverable; no Gaussian filter yet gets
+      BOTH radial and tangential.
+    - **Barometer on/off is decisive (`--baro`, relative-altitude channel via a residual mixin →
+      BaroEKF/BaroUKF; companion model untouched).** Adding a baro (σ=0.2 m): (i) crushes the vertical
+      error (EKF z 1.5→0.5, UKF z 2.6→0.5 m), and (ii) **CURES the UKF's radial bias (5.3→0.67 m)** —
+      observing a weak direction bounds P_pos, so the tr(P_pos) Jensen bias collapses. **Result: with a
+      barometer the UKF is the BEST estimator (pos 1.18 m) and recovers BOTH radial (0.67) AND
+      tangential (0.98) AND z (0.50).** The thesis realized: keep the STLOG orbit, add a cheap baro, use
+      the 2nd-order UKF, and the high-order observability finally pays off (UKF tangential 0.98 < EKF
+      1.55). The barometer is a *synergistic* sensor, not a complication. (The bootstrap PF degrades
+      under the tighter 6-d likelihood — underpowered, weight-collapse — not a fair gold standard; the
+      RBPF marginalizing the observed directions is the right PF.) Caveats: 10 seeds, one orbit; the
+      decisive next test is the **carried CLOSED loop with baro+UKF** (does it beat the seed-fragile
+      19%?), plus a baro-σ sweep and the spectrum {range / range+baro / 2-range}. Reproduce:
+      `experiments/estimator_ladder.py --npz <stlog dump> [--baro]`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
