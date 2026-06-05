@@ -241,6 +241,16 @@ def optimize(args):
     opt_s, pos_opt = evaluate(jnp.asarray(best_u))
     base_s, opt_s = np.asarray(base_s), np.asarray(opt_s)
     pos_base, pos_opt = np.asarray(pos_base), np.asarray(pos_opt)
+    # full input sequences (leader+follower) and x0 -- replayable through the estimator ladder
+    us_opt = np.concatenate([np.asarray(u_leader), np.asarray(best_u)], axis=1)
+    us_base = np.concatenate([np.asarray(u_leader), np.asarray(u_foll0)], axis=1)
+    orbit_arrays = {
+        "pos_opt": pos_opt,
+        "pos_base": pos_base,
+        "us_opt": us_opt,
+        "us_base": us_base,
+        "x0": np.asarray(x0),
+    }
     return (
         {
             "objective": args.objective,
@@ -264,8 +274,7 @@ def optimize(args):
             "opt_los_rotation": los_rotation(pos_opt),
             "tighter_x": float(base_s[0]) / max(float(opt_s[0]), 1e-9),
         },
-        pos_opt,
-        pos_base,
+        orbit_arrays,
     )
 
 
@@ -288,7 +297,7 @@ def main():
     )
     args = ap.parse_args()
 
-    metrics, pos_opt, pos_base = optimize(args)
+    metrics, orbit = optimize(args)
     print(json.dumps(metrics, indent=2))
     print(
         f"\n[{args.objective} | band {metrics['band']} | N={metrics['steps']} | {args.leader}] "
@@ -302,7 +311,7 @@ def main():
             json.dumps(metrics, indent=2), encoding="utf-8"
         )
     if args.dump_orbit:
-        np.savez(args.dump_orbit, pos_opt=pos_opt, pos_base=pos_base)
+        np.savez(args.dump_orbit, **orbit)
 
 
 def _quat_z(deg):
