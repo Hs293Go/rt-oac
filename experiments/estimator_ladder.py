@@ -147,18 +147,38 @@ class ParticleFilter:
         return parts, pos_mean
 
 
-def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, n_seeds, warmup):
-    """Monte-Carlo the estimator ladder along the fixed orbit; return per-estimator error stats."""
+def run_orbit(
+    x0,
+    us,
+    dt,
+    sim,
+    ekf,
+    ukf,
+    pf_factory,
+    obs_fn,
+    obs_var,
+    n_seeds,
+    warmup,
+    p0_scale=1.0,
+    baro_bias=0.0,
+):
+    """Monte-Carlo the estimator ladder along the fixed orbit.
+
+    Returns per-estimator stats: per-seed RMS aggregated as mean +- std across seeds (so the
+    significance is visible), the radial/tangential/vertical split, and the mean steady-state
+    ``trace(P_pos)`` for the Gaussian filters (the P-inflation mechanism check).
+    """
     N = us.shape[0]
-    P0 = np.diag(P0_DIAG)
+    P0 = np.diag(P0_DIAG) * p0_scale
     L0 = np.linalg.cholesky(P0)
-    acc = {
-        k: {"rad": [], "tang": [], "pos": [], "z": []}
-        for k in ("ekf", "iekf", "ukf", "pf")
+    names = ("ekf", "iekf", "ukf", "pf")
+    per_seed = {
+        n: {"pos": [], "rad": [], "tang": [], "z": [], "ptr": []} for n in names
     }
+    has_baro = len(obs_var) == 6
     for s in range(n_seeds):
         rng = np.random.default_rng(1000 + s)
-        # truth realization (process + input noise) and measurements along the orbit
+        # truth realization (input noise only) + measurements along the orbit
         xs_true = np.zeros((N + 1, 10))
         xs_true[0] = renorm(x0)
         ys = np.zeros((N, len(obs_var)))
@@ -166,17 +186,16 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, n_seeds, w
             ys[k] = np.asarray(obs_fn(jnp.asarray(xs_true[k]))) + rng.normal(
                 0, np.sqrt(obs_var)
             )
+            if baro_bias and has_baro:
+                ys[k][5] += (
+                    baro_bias  # adversarial: a biased (not just noisy) barometer
+                )
             un = us[k].copy()
             un[4:] += rng.normal(
                 0, np.sqrt(INPUT_VAR[4:])
-            )  # input noise the filter doesn't know
-            xn = np.asarray(
-                sim(jnp.asarray(xs_true[k]), jnp.asarray(un))[0]
-            )  # Integrator -> (x_next, aux)
-            xs_true[k + 1] = renorm(
-                xn
-            )  # truth = deterministic dynamics + input noise (matches example)
-        # common wrong prior
+            )  # input noise the filter misses
+            xn = np.asarray(sim(jnp.asarray(xs_true[k]), jnp.asarray(un))[0])
+            xs_true[k + 1] = renorm(xn)  # truth = deterministic dynamics + input noise
         x_hat0 = renorm(
             np.asarray(
                 ekf._manifold.boxplus(
@@ -185,22 +204,21 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, n_seeds, w
             )
         )
 
-        runs = {}
-        # EKF (1st-order) / IEKF (Gauss-Newton MAP) / UKF (2nd-order), all carried
-        estimators = (
+        runs, ptraces = {}, {}
+        for name, pred, upd in (
             ("ekf", ekf.predict, ekf.update),
             ("iekf", ekf.predict, ekf.update_iterated),
             ("ukf", ukf.predict, ukf.update),
-        )
-        for name, pred, upd in estimators:
+        ):
             xh, P = x_hat0.copy(), P0.copy()
-            errs = []
+            errs, ptr = [], []
             for k in range(N):
                 xh, P = pred(jnp.asarray(xh), jnp.asarray(P), jnp.asarray(us[k]), dt)
                 xh, P = upd(jnp.asarray(xh), jnp.asarray(P), jnp.asarray(ys[k]))
-                xh = renorm(xh)
+                xh, P = renorm(xh), np.asarray(P)
                 errs.append(xh[0:3] - xs_true[k + 1][0:3])
-            runs[name] = errs
+                ptr.append(float(np.trace(P[0:3, 0:3])))  # claimed position uncertainty
+            runs[name], ptraces[name] = errs, ptr
         # PF carried
         pf = pf_factory(rng.integers(1 << 30))
         parts = jax.vmap(
@@ -212,24 +230,32 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, n_seeds, w
                 parts, jnp.asarray(us[k]), jnp.asarray(ys[k]), dt
             )
             errs.append(pos_mean - xs_true[k + 1][0:3])
-        runs["pf"] = errs
+        runs["pf"], ptraces["pf"] = errs, [float("nan")] * N  # PF has no covariance
 
         for name, errs in runs.items():
+            rad, tang, pos, z = [], [], [], []
             for k in range(warmup, N):
-                rad, tang = radial_tangential(np.asarray(errs[k]), xs_true[k + 1][0:3])
-                acc[name]["rad"].append(rad)
-                acc[name]["tang"].append(tang)
-                acc[name]["pos"].append(float(np.linalg.norm(errs[k])))
-                acc[name]["z"].append(
-                    abs(float(errs[k][2]))
-                )  # vertical: the baro's target
+                r, t = radial_tangential(np.asarray(errs[k]), xs_true[k + 1][0:3])
+                rad.append(r)
+                tang.append(t)
+                pos.append(float(np.linalg.norm(errs[k])))
+                z.append(abs(float(errs[k][2])))
+            per_seed[name]["pos"].append(float(np.sqrt(np.mean(np.square(pos)))))
+            per_seed[name]["rad"].append(float(np.sqrt(np.mean(np.square(rad)))))
+            per_seed[name]["tang"].append(float(np.sqrt(np.mean(np.square(tang)))))
+            per_seed[name]["z"].append(float(np.sqrt(np.mean(np.square(z)))))
+            per_seed[name]["ptr"].append(float(np.mean(ptraces[name][warmup:])))
     out = {}
-    for name, d in acc.items():
+    for name in names:
+        d = per_seed[name]
         out[name] = {
-            "rms_pos": float(np.sqrt(np.mean(np.square(d["pos"])))),
-            "rms_radial": float(np.sqrt(np.mean(np.square(d["rad"])))),
-            "rms_tangential": float(np.sqrt(np.mean(np.square(d["tang"])))),
-            "rms_z": float(np.sqrt(np.mean(np.square(d["z"])))),
+            "rms_pos": float(np.mean(d["pos"])),
+            "rms_pos_std": float(np.std(d["pos"])),
+            "rms_radial": float(np.mean(d["rad"])),
+            "rms_tangential": float(np.mean(d["tang"])),
+            "rms_tangential_std": float(np.std(d["tang"])),
+            "rms_z": float(np.mean(d["z"])),
+            "mean_trP_pos": float(np.nanmean(d["ptr"])),
         }
     return out
 
@@ -257,6 +283,20 @@ def main():
         default=0.2,
         dest="baro_std",
         help="baro noise std (m)",
+    )
+    ap.add_argument(
+        "--baro-bias",
+        type=float,
+        default=0.0,
+        dest="baro_bias",
+        help="adversarial constant baro bias (m)",
+    )
+    ap.add_argument(
+        "--p0-scale",
+        type=float,
+        default=1.0,
+        dest="p0_scale",
+        help="scale the prior covariance P0",
     )
     args = ap.parse_args()
 
@@ -324,29 +364,35 @@ def main():
         f"PF {args.particles} particles, warmup {warmup}"
     )
     out = run_orbit(
-        x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, args.seeds, warmup
+        x0,
+        us,
+        dt,
+        sim,
+        ekf,
+        ukf,
+        pf_factory,
+        obs_fn,
+        obs_var,
+        args.seeds,
+        warmup,
+        p0_scale=args.p0_scale,
+        baro_bias=args.baro_bias,
     )
     print(
-        f"\n{'estimator':<10}{'RMS pos':>10}{'RMS radial':>12}{'RMS tangential':>16}{'RMS z':>10}"
+        f"\n{'est':<6}{'RMS pos(±std)':>15}{'radial':>9}{'tang(±std)':>14}"
+        f"{'z':>8}{'tr(P_pos)':>12}"
     )
     for name in ("ekf", "iekf", "ukf", "pf"):
         r = out[name]
         print(
-            f"{name.upper():<10}{r['rms_pos']:>10.3f}{r['rms_radial']:>12.3f}"
-            f"{r['rms_tangential']:>16.3f}{r['rms_z']:>10.3f}"
+            f"{name.upper():<6}{r['rms_pos']:>8.3f}±{r['rms_pos_std']:<5.2f}"
+            f"{r['rms_radial']:>9.3f}{r['rms_tangential']:>8.3f}±{r['rms_tangential_std']:<4.2f}"
+            f"{r['rms_z']:>8.3f}{r['mean_trP_pos']:>12.2f}"
         )
-    pf_t, ekf_t = out["pf"]["rms_tangential"], out["ekf"]["rms_tangential"]
+    u_t, e_t = out["ukf"]["rms_tangential"], out["ekf"]["rms_tangential"]
     print(
-        f"\nPF vs EKF tangential RMS: {ekf_t:.3f} -> {pf_t:.3f} m  (x{ekf_t / max(pf_t, 1e-9):.2f} tighter)"
-    )
-    print(
-        "  >>1 => a better estimator recovers tangential observability the EKF leaves on the table"
-    )
-    print(
-        "        (the high-order / non-Gaussian info is real; first-order is the bottleneck)."
-    )
-    print(
-        "  ~1  => the recursive limit is fundamental (process noise); estimator ORDER is not the lever."
+        f"\nUKF vs EKF tangential RMS: {e_t:.3f} -> {u_t:.3f} m "
+        f"(x{e_t / max(u_t, 1e-9):.2f}); UKF best pos = {out['ukf']['rms_pos']:.3f} m"
     )
     import json
 
