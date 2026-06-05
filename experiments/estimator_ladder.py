@@ -127,7 +127,7 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, n_seeds, warmup):
     N = us.shape[0]
     P0 = np.diag(P0_DIAG)
     L0 = np.linalg.cholesky(P0)
-    acc = {k: {"rad": [], "tang": [], "pos": []} for k in ("ekf", "ukf", "pf")}
+    acc = {k: {"rad": [], "tang": [], "pos": []} for k in ("ekf", "iekf", "ukf", "pf")}
     for s in range(n_seeds):
         rng = np.random.default_rng(1000 + s)
         # truth realization (process + input noise) and measurements along the orbit
@@ -158,15 +158,18 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, n_seeds, warmup):
         )
 
         runs = {}
-        # EKF / UKF carried
-        for name, filt in (("ekf", ekf), ("ukf", ukf)):
+        # EKF (1st-order) / IEKF (Gauss-Newton MAP) / UKF (2nd-order), all carried
+        estimators = (
+            ("ekf", ekf.predict, ekf.update),
+            ("iekf", ekf.predict, ekf.update_iterated),
+            ("ukf", ukf.predict, ukf.update),
+        )
+        for name, pred, upd in estimators:
             xh, P = x_hat0.copy(), P0.copy()
             errs = []
             for k in range(N):
-                xh, P = filt.predict(
-                    jnp.asarray(xh), jnp.asarray(P), jnp.asarray(us[k]), dt
-                )
-                xh, P = filt.update(jnp.asarray(xh), jnp.asarray(P), jnp.asarray(ys[k]))
+                xh, P = pred(jnp.asarray(xh), jnp.asarray(P), jnp.asarray(us[k]), dt)
+                xh, P = upd(jnp.asarray(xh), jnp.asarray(P), jnp.asarray(ys[k]))
                 xh = renorm(xh)
                 errs.append(xh[0:3] - xs_true[k + 1][0:3])
             runs[name] = errs
@@ -260,7 +263,7 @@ def main():
     )
     out = run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, args.seeds, warmup)
     print(f"\n{'estimator':<10}{'RMS pos':>10}{'RMS radial':>12}{'RMS tangential':>16}")
-    for name in ("ekf", "ukf", "pf"):
+    for name in ("ekf", "iekf", "ukf", "pf"):
         r = out[name]
         print(
             f"{name.upper():<10}{r['rms_pos']:>10.3f}{r['rms_radial']:>12.3f}{r['rms_tangential']:>16.3f}"

@@ -311,6 +311,45 @@ class ErrorStateEKF:
         P_next = 0.5 * (P_next + P_next.T)
         return x_next, P_next
 
+    # ---- iterated update (Gauss-Newton MAP) ---------------------------------------
+    @functools.partial(jax.jit, static_argnames=["self", "n_iters"])
+    def update_iterated(self, x, P, y, n_iters=5):
+        r"""Iterated EKF update: relinearize the measurement at the posterior (GN MAP).
+
+        The EKF linearizes the (nonlinear, squared-range) measurement once at the prior,
+        under-correcting the weakly-observed tangential subspace. The IEKF re-forms the
+        Jacobian ``H_i`` and residual at each iterate ``x_i`` and takes the Gauss-Newton
+        step **from the prior mean** ``x``, converging to the MAP estimate
+        ``x_{i+1} = x boxplus K_i (nu_i + H_i (x_i boxminus x))``. It captures the
+        measurement curvature like the UKF but without the unscented Jensen bias
+        ``E[||r||^2] = ||mu||^2 + tr(P)`` that corrupts the UKF radial channel at wide
+        P. Covariance uses the converged H; ``n_iters=1`` reproduces the EKF.
+        """
+        zero = jnp.zeros(self._tangent_dim)
+
+        def jac_at(xi):
+            return -jax.jacobian(
+                lambda d: self._residual(self._manifold.boxplus(xi, d), y)
+            )(zero)
+
+        def body(_, xi):
+            H = jac_at(xi)
+            nu = self._residual(xi, y)  # y boxminus h(x_i)
+            b = self._boxminus(xi, x)  # iterate's tangent offset from the prior x
+            S = H @ P @ H.T + self._obs_cov
+            K = jla.solve(S.T, H @ P).T
+            return self._manifold.boxplus(x, K @ (nu + H @ b))  # GN step from the prior
+
+        x_next = jax.lax.fori_loop(0, n_iters, body, x)
+
+        H = jac_at(x_next)
+        S = H @ P @ H.T + self._obs_cov
+        K = jla.solve(S.T, H @ P).T
+        ikh = jnp.eye(self._tangent_dim) - K @ H
+        P_next = ikh @ P @ ikh.T + K @ self._obs_cov @ K.T
+        P_next = 0.5 * (P_next + P_next.T)
+        return x_next, P_next
+
     # ---- truth pseudo-measurement ("training-wheels" anchor) ----------------------
     @functools.partial(jax.jit, static_argnames=["self"], donate_argnums=[1, 2])
     def update_anchor(self, x, P, x_ref, R_anchor):
