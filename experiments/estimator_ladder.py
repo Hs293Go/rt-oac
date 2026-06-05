@@ -27,6 +27,7 @@ Feed it an orbit dump with x0 + the full input sequence us (N,8):
 import argparse
 import functools
 
+from example_lib import math as elmath
 from example_lib.models import inter_quadrotor_pose as mdl
 import jax
 import jax.numpy as jnp
@@ -41,6 +42,31 @@ jax.config.update("jax_enable_x64", True)
 INPUT_VAR = np.tile([0.05, 0.01, 0.01, 0.01], 2)
 PROC_VAR = np.array([0.02, 0.02, 0.02, 1e-4, 1e-4, 1e-4, 0.05, 0.05, 0.05])
 P0_DIAG = np.array([2.0, 2.0, 2.0, 0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
+
+
+def baro_observation(x):
+    """Barometer-augmented observation [range^2, quat(4), relative-altitude r_z] (6-d)."""
+    return jnp.concatenate([mdl.observation(x), x[2:3]])
+
+
+class _BaroResidual:
+    """Residual mixin for the 6-d barometer observation -> 5-d residual [range, att(3), baro]."""
+
+    def _residual(self, x, y):
+        hx = self._observation(x)
+        range_resid = y[0:1] - hx[0:1]
+        att_resid = elmath.quaternion_log(
+            elmath.quaternion_product(elmath.quaternion_inverse(hx[1:5]), y[1:5])
+        )
+        return jnp.concatenate([range_resid, att_resid, y[5:6] - hx[5:6]])
+
+
+class BaroEKF(_BaroResidual, ErrorStateEKF):
+    pass
+
+
+class BaroUKF(_BaroResidual, ManifoldUKF):
+    pass
 
 
 def renorm(x):
@@ -121,21 +147,23 @@ class ParticleFilter:
         return parts, pos_mean
 
 
-def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, n_seeds, warmup):
+def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, n_seeds, warmup):
     """Monte-Carlo the estimator ladder along the fixed orbit; return per-estimator error stats."""
-    obs_var = np.concatenate([[ekf._obs_cov[0, 0]], np.full(4, ekf._obs_cov[1, 1])])
     N = us.shape[0]
     P0 = np.diag(P0_DIAG)
     L0 = np.linalg.cholesky(P0)
-    acc = {k: {"rad": [], "tang": [], "pos": []} for k in ("ekf", "iekf", "ukf", "pf")}
+    acc = {
+        k: {"rad": [], "tang": [], "pos": [], "z": []}
+        for k in ("ekf", "iekf", "ukf", "pf")
+    }
     for s in range(n_seeds):
         rng = np.random.default_rng(1000 + s)
         # truth realization (process + input noise) and measurements along the orbit
         xs_true = np.zeros((N + 1, 10))
         xs_true[0] = renorm(x0)
-        ys = np.zeros((N, 5))
+        ys = np.zeros((N, len(obs_var)))
         for k in range(N):
-            ys[k] = np.asarray(mdl.observation(jnp.asarray(xs_true[k]))) + rng.normal(
+            ys[k] = np.asarray(obs_fn(jnp.asarray(xs_true[k]))) + rng.normal(
                 0, np.sqrt(obs_var)
             )
             un = us[k].copy()
@@ -192,12 +220,16 @@ def run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, n_seeds, warmup):
                 acc[name]["rad"].append(rad)
                 acc[name]["tang"].append(tang)
                 acc[name]["pos"].append(float(np.linalg.norm(errs[k])))
+                acc[name]["z"].append(
+                    abs(float(errs[k][2]))
+                )  # vertical: the baro's target
     out = {}
     for name, d in acc.items():
         out[name] = {
             "rms_pos": float(np.sqrt(np.mean(np.square(d["pos"])))),
             "rms_radial": float(np.sqrt(np.mean(np.square(d["rad"])))),
             "rms_tangential": float(np.sqrt(np.mean(np.square(d["tang"])))),
+            "rms_z": float(np.sqrt(np.mean(np.square(d["z"])))),
         }
     return out
 
@@ -214,6 +246,18 @@ def main():
     ap.add_argument("--particles", type=int, default=8000)
     ap.add_argument("--seeds", type=int, default=24)
     ap.add_argument("--label", default="orbit")
+    ap.add_argument(
+        "--baro",
+        action="store_true",
+        help="add a barometer (relative-altitude) channel",
+    )
+    ap.add_argument(
+        "--baro-std",
+        type=float,
+        default=0.2,
+        dest="baro_std",
+        help="baro noise std (m)",
+    )
     args = ap.parse_args()
 
     if args.npz:
@@ -226,24 +270,41 @@ def main():
     warmup = min(20, N // 3)
 
     range_var, att_var = 0.01, 0.01  # matches conf noise
-    res_var = np.concatenate([[range_var], np.full(3, att_var)])
     dt = 0.05
     sim = jax.jit(
         integrator.Integrator(
             mdl.dynamics, integrator.Methods.EULER, stepsize=dt, manifold=mdl.MANIFOLD
         )
     )
+    # measurement set: range + attitude, optionally + barometer (relative altitude)
+    if args.baro:
+        obs_fn = baro_observation  # 6-d measurement
+        res_var = np.array([range_var, att_var, att_var, att_var, args.baro_std**2])
+        obs_var = np.array([
+            range_var,
+            att_var,
+            att_var,
+            att_var,
+            att_var,
+            args.baro_std**2,
+        ])
+        ekf_cls, ukf_cls = BaroEKF, BaroUKF
+    else:
+        obs_fn = mdl.observation  # 5-d measurement
+        res_var = np.array([range_var, att_var, att_var, att_var])
+        obs_var = np.concatenate([[range_var], np.full(4, att_var)])
+        ekf_cls, ukf_cls = ErrorStateEKF, ManifoldUKF
     common = {
         "dynamics": mdl.dynamics,
-        "observation": lambda x: mdl.observation(x),
+        "observation": obs_fn,
         "manifold": mdl.MANIFOLD,
         "in_cov": np.diag(INPUT_VAR),
         "obs_cov": np.diag(res_var),
         "proc_cov": np.diag(PROC_VAR),
         "method": integrator.Methods.EULER,
     }
-    ekf = ErrorStateEKF(**common)
-    ukf = ManifoldUKF(**common)
+    ekf = ekf_cls(**common)
+    ukf = ukf_cls(**common)
 
     def pf_factory(seed):
         return ParticleFilter(
@@ -259,14 +320,20 @@ def main():
         )
 
     print(
-        f"orbit '{args.label}': N={N} steps, {args.seeds} seeds, PF {args.particles} particles, warmup {warmup}"
+        f"orbit '{args.label}' baro={args.baro}: N={N} steps, {args.seeds} seeds, "
+        f"PF {args.particles} particles, warmup {warmup}"
     )
-    out = run_orbit(x0, us, dt, sim, ekf, ukf, pf_factory, args.seeds, warmup)
-    print(f"\n{'estimator':<10}{'RMS pos':>10}{'RMS radial':>12}{'RMS tangential':>16}")
+    out = run_orbit(
+        x0, us, dt, sim, ekf, ukf, pf_factory, obs_fn, obs_var, args.seeds, warmup
+    )
+    print(
+        f"\n{'estimator':<10}{'RMS pos':>10}{'RMS radial':>12}{'RMS tangential':>16}{'RMS z':>10}"
+    )
     for name in ("ekf", "iekf", "ukf", "pf"):
         r = out[name]
         print(
-            f"{name.upper():<10}{r['rms_pos']:>10.3f}{r['rms_radial']:>12.3f}{r['rms_tangential']:>16.3f}"
+            f"{name.upper():<10}{r['rms_pos']:>10.3f}{r['rms_radial']:>12.3f}"
+            f"{r['rms_tangential']:>16.3f}{r['rms_z']:>10.3f}"
         )
     pf_t, ekf_t = out["pf"]["rms_tangential"], out["ekf"]["rms_tangential"]
     print(
