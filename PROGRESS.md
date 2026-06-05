@@ -288,6 +288,37 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
       decisive next test is the **carried CLOSED loop with baro+UKF** (does it beat the seed-fragile
       19%?), plus a baro-σ sweep and the spectrum {range / range+baro / 2-range}. Reproduce:
       `experiments/estimator_ladder.py --npz <stlog dump> [--baro]`.
+20. **[2026-06-04] FIRM-UP of #19 (5 probes + 3 adversarial verifiers; `report/figures/baro_ladder.png`).
+    The baro+UKF result is real and the mechanism is rock-solid — but the win is *modest-margin* and
+    *geometry-conditional*, and the closed-loop GO comes with a tight envelope.** Tooling upgraded:
+    per-seed mean±std (significance), `mean_trP_pos` logged (inflation gauge), `--baro-std/--p0-scale/
+    --baro-bias` knobs.
+    - **Significance (40 seeds, STLOG): firm on substance, modest margin.** Baro-off the UKF tangential
+      0.42 m (std 0.19, ~11× std below EKF 2.39) — high-order recovery unambiguous — while its radial
+      blows up (5.5 m, tr(P_pos) 94.5). Baro-on the UKF is the best estimator (pos **1.01 m**, std 0.30)
+      recovering radial 0.49 + tangential 0.87 + z 0.51, tr(P_pos) 0.79. **But** the UKF↔EKF pos gap
+      (0.72 m) only ≈ the EKF's std (0.72) — bands overlap; report as "best, modest margin," not
+      decisively separated (the UKF's *own* spread is tight, so it's 2.4× the UKF std).
+    - **Mechanism CONFIRMED (Spearman 1.0).** UKF radial tracks tr(P_pos) monotonically (OFF 94.7/5.39 m
+      → std0.2 0.78/0.49 m); the **EKF tr(P_pos) never inflates** (control — the ‖r‖²-Jensen term is
+      carried only by the sigma-point UKF). So **tr(P_pos) is a reliable online early-warning gauge**.
+    - **Baro-σ requirement: solid cure ≤ 0.5 m std, headline ≤ 0.2 m; knee ~1 m; useless > ~2 m.**
+      Degradation is GRACEFUL (trP rolls 0.68→11.7 with noise) — the ~95× inflation appears only as a
+      *discontinuous jump* when the channel is fully removed. A realistic baro (≤0.5 m) works.
+    - **Robustness: bad prior FULLY robust** (10×-wrong prior → pos 1.18 m, recovers both; PF diverges).
+      **Biased baro tolerable to ~0.2 m**, advantage gone by 0.5 m, broken at 1.0 m bias.
+    - **CROSS-ORBIT = GEOMETRY-DEPENDENT (the key caveat).** Wins on the STLOG and PCRB-optimized
+      (observability-designed) orbits, but **FAILS on the naive warm-start orbit**: the baro fixes z
+      (→0.12 m) yet leaves radial (1.63→1.65) and tr(P_pos) untouched. The baro→radial cure only
+      translates when the radial-unobservable direction is **geometrically coupled to altitude**; on a
+      near-static side-by-side geometry (horizontal LOS) it is decoupled and the cure does nothing.
+    **GO for the closed-loop test, tight envelope:** STLOG/PCRB-style geometry, baro std ≤ 0.2 m, bias
+    < 0.2 m. **Biggest risk = geometry coupling:** the closed-loop controller continuously reshapes the
+    geometry, so it can steer into radial-⊥-altitude configurations that silently re-open the P_pos
+    inflation the open-loop test never sees. **Mitigation: monitor tr(P_pos) online** (Spearman-1.0
+    early warning) and gate/penalize geometries where it climbs. Reproduce: the firm-up workflow / the
+    ladder's `--seeds/--baro-std/--p0-scale/--baro-bias` knobs; figure generator
+    `report/figures/make_baro_ladder.py`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
