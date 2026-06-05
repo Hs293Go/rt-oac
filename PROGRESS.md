@@ -225,6 +225,44 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     decides); (ii) the Riccati-in-the-objective is nested autodiff (2nd-order) — a real-time concern for
     wiring into RTController, so Phase B should also try the cheaper accumulated-`W_o` min-eig surrogate
     (no per-step inverse). Reproduce: `experiments/pcrb_optimize.py --steps 30 --iters 80`.
+18. **[2026-06-04] Exhaustive PCRB-optimizer sweep (5 parallel investigations + 3 adversarial
+    verifiers + synthesis; `report/figures/pcrb_sweep.png`). The reformulation helps a lot and is
+    robust — but a structural ceiling above the standoff means it likely cannot close the gap alone.**
+    The generalized `experiments/pcrb_optimize.py` (objective forms / band / horizon / leader /
+    p0-scale / restarts, JSON dump) was swept:
+    - **Floor: ~1.4–1.6 m (from STLOG 3.6 m / planar warm-start 5.6 m), a robust ~3–4× gain.**
+      Counter-intuitively the *absolute* floor is LOWEST at the SHORTEST horizon (N=20→1.23 m, N=80→
+      2.05 m); long horizons only *look* better via `tighter_x` because the base orbit rots faster. And
+      **iterations, not horizon, are the binding limit** (N=40: 1.67→1.58→1.44 m at 80/150/300 iters,
+      no plateau).
+    - **Best objective: `maxeig` or `trace` on the recursive EKF covariance (tie ~1.56–1.58 m, band
+      held).** `posvel` is fractionally lower and best-on-velocity (3.4 m) but dips below the standoff
+      floor (a real pos/vel/band three-way trade). **The batch-`W_o` objectives are VERIFIED-POOR
+      (4.4–4.6 m, ~2.3–3.3× worse, break the band)** — i.e. minimizing observability *volume* (the
+      STLOG-style target) is the wrong objective for recursive localizability. Confirmed non-tautologically
+      (logdet-vs-wo_mineig, different reducer than the yardstick).
+    - **Pareto: monotone, ≈0.47 m of localization error per metre of standoff backoff.** The strong
+      "inner-edge / closer-is-better" claim **FAILED verification** — a close band ([0.3,0.5]) can't be
+      held and forcing it makes PCRB *worse*. The real lever is band **width/slack**, not center: a wide
+      band [0.3,2.0] is the global best (1.44 m) because slack lets the optimizer dip toward the inner
+      edge voluntarily while staying feasible. **Wire a soft, WIDE band — not a tight clamp.**
+    - **Robust, not overfit:** opt 3σ_pos = 1.53–1.66 m (~8% spread) across p0-scale 0.3–10×, seeds,
+      and — notably — **leader maneuver gives ZERO improvement** (1.578 vs 1.580 m). The floor is a
+      geometry property.
+    - **Mechanism:** the optimizer maximizes **out-of-plane LOS rotation** (5–9× more swept angle, via a
+      vertical weave/spiral, not a faster horizontal circle) **plus range-scale diversity** — which are
+      *complementary*: an over-tight band swept the *most* LOS (9.5 rad) yet localized *worst* (1.81 m)
+      by starving range diversity.
+    - **THE STRUCTURAL CEILING (biggest open question):** even the best orbit (~1.4 m 3σ_pos) stays
+      *above* the ~1 m standoff, and leader maneuvering can't help. A single-scalar-range-per-step,
+      hover-leader geometry appears unable to localize the follower tighter than the formation itself.
+      So objective reformulation is necessary and ~3–4× helpful but probably **not sufficient alone** to
+      bound the carried loop. **Phase C must confront this:** (a) break the one-scalar-per-step bottleneck
+      (a second range anchor / heterogeneous measurement), and/or (b) accept ~1.4 m and design the
+      control to tolerate position uncertainty ~the standoff (ties back to the robust-control path).
+    Adversarial verdicts: headroom-is-real **SURVIVED** (strict band wband=500/2000 still 1.65–1.74 m,
+    viol ≤1e-6; the win is position-only — velocity does not improve); recursive-beats-batch
+    **SURVIVED**; strong inner-edge **FAILED**. Reproduce via the sweep workflow / the tool's `--dump`.
 
 ## 4. Fidelity to the companion example & paper
 - Structurally faithful to `examples/quadrotor_cooperative_navigation.py` (same model, leader,
