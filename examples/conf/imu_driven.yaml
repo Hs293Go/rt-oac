@@ -1,0 +1,19 @@
+# RT-OAC (E1,O0) IMU-driven headline -- Hydra config. Flat-output 2-range OAC re-planned on a CARRIED
+# collaborative INS (IMU-driven), geometric tracker, full quad truth, two known leaders, closed loop.
+# Override on the CLI, e.g.:
+#   uv run python examples/imu_driven_cooperative_navigation.py spawn=true
+#   uv run python examples/imu_driven_cooperative_navigation.py seed=3
+defaults:
+  - override hydra/job_logging: disabled # no <script>.log in cwd
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+seed: 0 # rollout seed (truth/IMU/range noise + the carried estimate's tangential offset direction)
+spawn: false # launch the live rerun viewer
+save: null # record the .rrd to this path (else results/example_imu_driven.rrd)
+report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
+
+hydra:
+  run: { dir: . }
+  output_subdir: null
+  job: { chdir: false }
