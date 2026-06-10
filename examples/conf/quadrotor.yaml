@@ -6,6 +6,7 @@
 #   uv run python examples/quadrotor_cooperative_navigation.py mode=open soft=true spawn=true
 defaults:
   - mode: open # open | estimation | hybrid  (see conf/mode/)
+  - scenario: quadrotor # the OAC problem (stlog/opc/noise/optim/sim); was config/quadrotor.toml
   - override hydra/job_logging: disabled # no <script>.log in cwd
   - override hydra/hydra_logging: disabled
   - _self_

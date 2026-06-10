@@ -183,6 +183,13 @@ ms on CPU. Plan file: `~/.claude/plans/create-a-plan-to-stateful-wind.md`.
     rank on the orbit yet the recursive filter does not converge (fact #14), so a metric targeting
     *recursive information accumulation* rather than instantaneous observability (ties to CLAUDE.md's
     "learn observability metrics from data"). Reproduce: `mode=hybrid filter={ekf,ukf} seed=0,..,15`.
+    **GUARDRAILS for the clean-branch quad climb distilled from this post-mortem (so we don't repeat the
+    class of mistake): `docs/quad_climb_guardrails.md`** — the class of mistake, what the ladder does and
+    does NOT prove (the flat-output/bridge "wins" escape the regime where the CRLB floor bites; the bridge
+    is open-loop tracking + a reduced post-hoc EKF, not a carried-quad loop), G1–G16, and a measured
+    go/no-go (currently **NO-GO** on closing the OA loop on a full carried quad estimate). Two adversarial
+    critics' code-verified catches are folded in (single-seed headline, 5 m "stable" bar vs 1.5 m,
+    NEES `median(neess[20:])` blind to the startup transient, ref-velocity recovery EKF).
 16. **[2026-06-04] Phase A (objective reformulation, chosen path c): the PCRB diagnostic locates the
     real bottleneck — recursive position localizability is comparable to the formation scale.**
     `experiments/fim_diagnostic.py` reconstructs, along the truth-planned OA orbit, the per-node STLOG
@@ -372,6 +379,19 @@ The leader's **motion is free** — the relative dynamics are Galilean-invariant
 cruise at any speed gives the identical relative trajectory), so a moving leader is a pure
 visualization choice (the closed-loop modes default to a 2 m/s cruise via `world_leader`).
 
+**`examples/flat_robot_cooperative_navigation.py` — the bottom-up range-only ladder's frontier (rung
+3a; `conf/flat_robot.yaml`).** A 3D FLAT-OUTPUT `[x,y,z,psi]` leader-follower (the quad's flat outputs;
+world-frame velocity kinematics), **range-only** cooperative localization (leader pose + both yaws
+measured, follower position only via the inter-robot range), carried EKF, the rung-2 stable recipe
+(softmin-eig + bounded standoff + symmetry-break). Same rerun + matplotlib instrumentation as the other
+two. Headline result: from a 2.26 m initial error in the *unobservable* (tangential) direction, OA
+drives the carried-EKF follower-position error **2.32 → 0.26 m (~9x; 20-seed median ~17x)** while no-OAC
+(fly straight) stays stuck, at ~3 ms/solve. This is the validated, beneficial+stable range-only OAC the
+quad lacked (#32-35) — and `experiments/flatout_bridge.py` shows the OA flat-output trajectory is
+quad-realizable (the benefit transfers ~6x through the geometric tracker, gated by trackability). The
+consolidated ladder (planar 12x → 3D 13x → flat-output 17x → quad bridge 6x, all range-only) is
+`report/figures/range_only_ladder.png`; see §9.
+
 Three tuning nuances, each backed by a benchmark:
 - **Quadrotor objective/band → soft-min `[1, 2] m`** (`benchmarks/quad_constraint_sweep.py`).
   Log-det (D-optimality) maximizes information *volume* and fills a 3D shell; **soft-min
@@ -425,3 +445,113 @@ general-purpose pieces to the companion when its WIP settles — `neg_logdet`/`n
 extra `gramian_metric` options (non-default) and `ErrorStateEKF` as a new file — and add a
 one-line pointer in the companion README to this repo. The controller fork, early-stop, and
 experiments stay here (they are the *departure* from the published method).
+
+## 9. Bottom-up OAC ladder (CURRENT DIRECTION — 2026-06-05)
+**Strategy.** A separate investigation (preserved on the `quad-baro-estimation` branch) exhaustively
+searched the quadrotor relative-pose system for a regime where observability-aware control *pays off* and
+found **none**: its sensors (range + DIRECT relative attitude + barometer) observe every limiting
+direction *passively*, so observability-seeking is redundant where the loop is stable and impossible
+where it is not (strip a sensor → the gap is structural, no trajectory recovers it). OAC pays off only
+when observability is **controllable AND marginal** (motion-dependent), which that rich-sensor system
+never is. **So: bottom-up — start from the simplest model where OAC IS beneficial, climb, carrying the
+design principles up.** (Full quad negative result + the baro+UKF/two-leader estimation tuning live on
+the `quad-baro-estimation` branch; this branch keeps only the clean ladder, fewer confoundable knobs.)
+
+**Rung 1 — planar unicycle, range-only** (`experiments/planar_oac_validate.py`). Leader-follower where
+the leader pose is measured but the FOLLOWER's position is observable only via the inter-robot range, so
+its tangential (cross-range) direction is motion-observable only — the controllable-marginal regime. OAC
+drives the unobservable initial error down where nothing else can: on a TANGENTIAL 2.26 m initial error,
+final follower-position error noac **2.20 m** (NEES 105, overconfident-wrong) → OAC **0.19 m** (NEES 6) =
+**11.8×**, 100% stable, ~3 ms/solve. Airtight via 4 controls: (i) directional sweep — benefit is largest
+on the tangential, smallest on the radial (range sees it anyway) = mechanism; (ii) a dumb sinusoidal
+weave gives **1.0×** — arbitrary motion fails, only the observability-AWARE optimization finds the
+maneuver that excites the unobservable mode; (iii) `oac_tight` — **11.9× at FIXED distance**, so it is the
+maneuver geometry, not getting closer; (iv) NEES-consistent + 100% stable across 20 seeds.
+
+**Rung 2 — 3D point-mass, range-only** (`experiments/point3d_oac_validate.py`). 6-state single-integrator
+point pair, follower 3D position via range only — now TWO unobservable tangential directions. Beneficial
+OAC **survives the dimensionality jump**, and the climb surfaced **three transferable design discoveries**
+(none visible at rung 1): (1) the symmetric straight-line config is a **DEGENERATE CRITICAL POINT** of the
+observability objective (gradient ~0, the optimizer can't move, OAC≡noac) → perturb the first guess to
+break symmetry; (2) **log-det DRIVES AWAY** — maximizing observability *volume* is baseline-maximizing, so
+on a few noise seeds the follower runs out and the estimate diverges (the SAME instability that sank the
+quad); (3) **softmin-eig** (E-optimality, worst-direction) is the **stable metric** — it stops once the
+worst axis is observed instead of spreading. **Stable + beneficial recipe = softmin-eig + bounded
+formation distance + symmetry-break: 100% stable across all directions, 7× (radial) / 13× / 15× (the two
+tangentials) lower error, NEES ~3–7 (vs noac 84–105), formation held at ~5 m.**
+
+**Rung 3a — FLAT-OUTPUT OA + the quad-realizability bridge** (`experiments/flatout_oac_validate.py`,
+`experiments/flatout_bridge.py`). Reframed per the lead (differential flatness, Mellinger-Kumar): a
+quad's flat outputs are `sigma=[x,y,z,psi]`; any smooth `sigma(t)` is dynamically feasible. So the
+principled OA-planning model is the FLAT-OUTPUT kinematics — the smallest state that is the quad's
+genuine planning space AND guaranteed realizable by the subservient (geometric) tracker. That is rung 2
++ a yaw state, and it's a *cleaner* rung 3 than full quad dynamics. **3a-core:** flat-output `[x,y,z,psi]`
+OA (world-frame velocity so psi is yaw-decoupled; omni range so psi is OA-INERT, a free flat output;
+yaws measured) reproduces rung 2 exactly — 20 seeds: tang 17–26×, radial 5.6×, 95–100% stable, recipe
+(softmin-eig + bounded dist + symmetry-break) carries. **3a-bridge (the milestone):** track the OA
+flat-output reference on the 10-state `quadrotor` via `TrackingController`+`AttitudeController`. **The OA
+benefit TRANSFERS to the quad** — a range-only EKF on the quad's ACTUAL trajectory recovers the
+unobservable error **up to 6× lower than no-OAC** (0.33 vs 1.97 m). **KEY NEW COUPLING the flat-output
+view exposes:** OA-aggressiveness ↔ trackability. The naive velocity-bounded OA plan is physically
+aggressive (peak **22 m/s² ≈ 2.3g** accel, **4.6g jerk** between steps — a quad does ~1g lateral), so it
+tracks imperfectly (~1 m); a 10× faster inner loop helps (1.74→0.99 m), and a *gentler* plan (scaled
+velocity bounds) tracks cleanly (~0.4 m) but excites less → smaller benefit (2.3× vs 6×). So the premise
+holds **conditionally**: OA flat-output trajectories are quad-realizable *as long as the planner
+respects feasibility* (bound accel/jerk / smoothness) — a real OA↔control coupling absent at the
+point-mass rungs, and exactly where the rung-2 recipe (tame the drive-away) pays off again.
+(A body-fixed BEARING sensor would make `psi` an active OA lever, but bearing is a CONFOUND vs the
+range-only JGCD paper — and has been stripped from the OG repo — so it is OFF the table; in range-only,
+`psi` is correctly a free flat output and the only OA lever is translation.)
+
+**3a-trackability RESOLVED — the derivative-bounded planner is DOMINATED + the gap is not the blocker
+(`experiments/flatout_di_oac.py`).** Tested the natural fix — plan one integration order higher, a
+DOUBLE-INTEGRATOR flat-output model with bounded ACCELERATION input (+ optional `--jerk` penalty) — so
+the trajectory is smooth/feasible by construction with a clean accel feedforward. It FAILS as an
+improvement, on an 8-seed bridge head-to-head (recovery vs no-OAC ~2.0 m): (1) per-component accel-bounds
+still hit 1.4 g and make the plan *jerkier* (the optimizer shifts aggressiveness to the next derivative,
+jerk max 88.7 > 45.7); (2) a within-window jerk penalty doesn't constrain the *applied* receding-horizon
+trajectory; (3) at the SAME ~0.6 m quad track error, simply **gentling** the velocity-bounded plan
+(`--vscale 0.7`) gives **4.2×** vs the DI's **2.7×** — scaling the velocity bound preserves the
+observability-effective maneuver GEOMETRY, re-planning in accel space loses it; (4) it's moot: the
+**aggressive** velocity-bounded plan transfers **6.3×** *despite* ~1 m (max 2.4 m) track error — the OA
+benefit comes from the quad **maneuvering vigorously, not tracking precisely**, so it's robust to track
+error. So OA-vs-trackability is a **fundamental Pareto traced by the velocity-bound scale** (aggressive
+6.3×@0.99 m → gentle 4.2×@0.62 m); adding integrator order doesn't beat it, and the "trackability gap" is
+a formation-keeping cost during the maneuver, NOT a blocker on the localization benefit. **Next:** climb
+to the full quad with the SAME range-only sensing, picking a point on this Pareto by how much
+formation-keeping fidelity the mission needs.
+
+**Ladder so far (CONSOLIDATED, all RANGE-ONLY; figure `report/figures/range_only_ladder.png`):** planar
+11.8× (rung 1) → 3D point-mass 7–15× @100% (rung 2) → flat-output `[x,y,z,psi]` 17–26× + quad-realizable,
+6× benefit transfers (rung 3a). Each rung: from a 2.26 m TANGENTIAL (motion-observable-only) initial
+error, no-OAC stays stuck ~2.2 m while OA recovers it ~12–17×; the recipe (softmin-eig + bounded standoff
++ symmetry-break) carries up. **Headline demo:** `examples/flat_robot_cooperative_navigation.py` (rerun +
+matplotlib, OA vs no-OAC, the polished rung-3a face; the planar headline `simple_robot_cooperative_
+navigation.py` is rung 1). Reproduce: `experiments/planar_oac_validate.py --seeds 20`;
+`experiments/point3d_oac_validate.py --seeds 20 --metric neg_softmin_eig`; `experiments/flatout_oac_validate.py
+--seeds 20`; `experiments/flatout_oac_validate.py --dump /tmp/oa.npz && experiments/flatout_bridge.py
+--ref /tmp/oa.npz`; figure `experiments/plot_range_only_ladder.py`.
+
+**Aside — does YAW matter? (the original quad's range+attitude obs; `experiments/freeze_yaw_test.py`,
+adversarially verified workflow `wj0rog3ox`).** Theory: yaw is rotation about the thrust axis, and the
+squared range + its time-derivatives are yaw-invariant (the `cross(r,ω)` transport terms cancel:
+`d²|r|²/dt² = 2|v|² + 2r·(R(q)t_l − t_f)`, both attitude terms yaw-invariant for a level/hover config).
+So for a pure range world yaw is a symmetry → inert (which is exactly what the world-frame flat-output
+model encodes). **But empirically the original quad OA commands HEAVY yaw** (RMS ~4, saturating the
+bound) — because the original ALSO observes the relative *attitude* `q_fl` (yaw-driven) and uses
+body-frame relative coords. **Freeze-yaw test verdict (after 3 wrong guesses — inert → dominant →
+counterproductive — all corrected by verification):** the ONLY robust conclusion is that the **STLOG
+objective is nearly FLAT in yaw** (frozen vs free <0.2% at every horizon) — the optimizer is
+near-indifferent to yaw, so the heavy commanded yaw is a near-null direction of the cost. Whether yaw
+helps the recursive *position* CRLB is **CONFOUNDED, not answerable** from freeze-vs-free: freezing yaw
+makes the optimizer re-plan a *different orbit* (pins the standoff to the 1 m min-distance bound vs 3 m
+→ closer = better range² SNR), and the position ratio *reverses* with horizon (0.46×@40 → 0.57×@80 →
+**1.96×@120**, frozen worse); the same-orbit counterfactual (zero yaw at fixed inputs) flips it again
+(P_pos↑1.33×, standoff→10.8 m). So **yaw is objective-flat but dynamically entangled** — its direct
+estimation effect isn't separable from the standoff/orbit. **Lesson:** OA control DOFs are coupled
+(yaw↔roll/pitch↔standoff); clean attribution needs a fixed-standoff counterfactual. **Closing the yaw
+question:** in a strictly RANGE-ONLY world (the JGCD paper), yaw is a symmetry of the objective → inert,
+full stop; the flat-output model is right to make `psi` a free output. The only way to make yaw matter
+is a yaw-sensitive (bearing/FOV) sensor — but that is a CONFOUND vs the range-only paper and has been
+stripped from the OG repo, so it is OFF the table. (Originally mis-scoped as "rung 3b"; retracted.)
+Reproduce: `experiments/freeze_yaw_test.py --steps {40,80,120}`.

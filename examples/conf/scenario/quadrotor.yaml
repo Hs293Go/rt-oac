@@ -1,0 +1,49 @@
+# Baseline quadrotor cooperative-navigation OAC scenario.
+# Folded from the former config/quadrotor.toml into the Hydra framework: composed into the
+# quadrotor example via `defaults: [scenario: quadrotor]` (override on the CLI, e.g.
+# `scenario.noise.range_var=0.1`), and loaded standalone by rt_oac.scenario.build_scenario
+# (default config) for the experiments/benchmarks. Mirrors the companion's
+# observability_aware_control/config/quadrotor_control_experiment.toml so RT-OAC solves the
+# exact same problem the paper's baseline solved.
+n_robots: 2
+
+leader:
+  trajectory:
+    # Recorded once into data/leader_trajectory.npz (min-snap through these waypoints, tracked
+    # by the geometric controller) so RT-OAC needs no minsnap/casadi dependency.
+    waypoints: [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0]]
+    timestamps: [0, 120]
+    timestep: 0.05
+    model_mass: 1.0
+
+followers:
+  init_state: [[0.0, 2.0, 7.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]
+
+stlog:
+  order: 5
+  dt: 0.2 # STLOG observation horizon T (short-time window)
+
+opc:
+  window_size: 20
+  observed_components: [0, 1, 2, 7, 8, 9] # position + velocity (attitude measured directly)
+  max_inter_vehicle_distance: 3.0
+  min_inter_vehicle_distance: 1.0
+
+noise:
+  range_var: 0.01
+  att_var: 0.01
+
+optim:
+  method: trust-constr
+  ub: [15.0, 4.0, 4.0, 6.0]
+  lb: [0.0, -4.0, -4.0, -2.0]
+  options:
+    disp: false
+    verbose: 0
+    maxiter: 40
+
+sim:
+  # Closed-loop receding-horizon initial condition (relative state, follower wrt leader).
+  init_state: [0.0, -1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+  integrator_dt: 0.05
+  steps: 4000

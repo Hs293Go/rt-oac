@@ -1,0 +1,18 @@
+# RT-OAC flat-output (rung 3a) headline -- Hydra config. 3D flat-output [x,y,z,psi] leader-follower,
+# RANGE-only cooperative localization, carried EKF, softmin-eig STLOG. Override on the CLI, e.g.:
+#   uv run python examples/flat_robot_cooperative_navigation.py spawn=true
+#   uv run python examples/flat_robot_cooperative_navigation.py soft=true
+defaults:
+  - override hydra/job_logging: disabled # no <script>.log in cwd
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+soft: false # distance band as a soft penalty + unconstrained L-BFGS-B (vs hard SLSQP)
+spawn: false # launch the live rerun viewer
+save: null # record the .rrd to this path (else results/example_flat_robot.rrd)
+report: null # dir for the report pipeline's <tag>.{npz,json} dump (null = off); see report/
+
+hydra:
+  run: { dir: . }
+  output_subdir: null
+  job: { chdir: false }

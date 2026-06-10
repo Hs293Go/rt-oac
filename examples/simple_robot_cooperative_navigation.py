@@ -1,5 +1,8 @@
 """Headline example: real-time planar leader-follower cooperative navigation, with rerun.
 
+**Rung 1** of the bottom-up RANGE-ONLY OAC ladder (planar unicycle -> 3D point-mass -> flat-output
+``[x,y,z,psi]``, see ``examples/flat_robot_cooperative_navigation.py`` and PROGRESS section 9).
+
 The future-work counterpart of the companion repo's
 ``examples/simple_robot_cooperative_navigation.py``. Same planar unicycle leader-follower
 (``leader_follower_robots``; the follower's position is observable only through the

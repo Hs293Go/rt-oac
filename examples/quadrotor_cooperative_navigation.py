@@ -191,7 +191,7 @@ def main(cfg: DictConfig):
     # the mode's validated default (open=300; closed-loop=120, where #8 / its resolution show).
     cfg.steps = cfg.steps if cfg.steps is not None else cfg.mode.default_steps
     lo, hi = float(cfg.mode.band[0]), float(cfg.mode.band[1])
-    sc = build_scenario(gramian_metric=metrics.neg_softmin_eig)
+    sc = build_scenario(cfg.scenario, gramian_metric=metrics.neg_softmin_eig)
     if cfg.mode.feedback == "estimate":
         # Closed-loop modes default to the scenario's (near-stationary min-snap) leader -- the
         # config the coupling work was validated on (drone_coupling_eval.py). With that leader the

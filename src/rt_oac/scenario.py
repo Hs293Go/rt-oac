@@ -15,7 +15,6 @@ enables JAX x64.
 from collections.abc import Callable
 import dataclasses
 from pathlib import Path
-import tomllib
 from typing import Any
 
 from example_lib.models import inter_quadrotor_pose as mdl
@@ -25,12 +24,16 @@ from observability_aware_control import (
     observability_aware_controller as oac_ctrl,
     observability_cost,
 )
+from omegaconf import DictConfig, OmegaConf
 
 import rt_oac  # noqa: F401  (bootstraps companion src + x64)
 from rt_oac.controller import RTController
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = REPO_ROOT / "config"
+# The scenario config lives in the Hydra config tree (a `scenario` group): the quadrotor
+# example composes it via `defaults: [scenario: quadrotor]`, and standalone callers
+# (experiments/benchmarks) load it here by default. One config framework, no TOML.
+SCENARIO_CONF = REPO_ROOT / "examples" / "conf" / "scenario" / "quadrotor.yaml"
 DATA_DIR = REPO_ROOT / "data"
 
 U_EQM = np.array([9.81, 0.0, 0.0, 0.0])
@@ -41,10 +44,9 @@ FOLLOWER_INDICES = (4, 5, 6, 7)
 """Indices of the follower's inputs in the stacked 8-vector (the decision variables)."""
 
 
-def load_config(path: str | Path = CONFIG_DIR / "quadrotor.toml") -> dict[str, Any]:
-    """Load a scenario TOML config."""
-    with Path(path).open("rb") as fp:
-        return tomllib.load(fp)
+def load_config(path: str | Path = SCENARIO_CONF) -> DictConfig:
+    """Load a scenario config (the Hydra/OmegaConf ``scenario`` group YAML)."""
+    return OmegaConf.load(Path(path))
 
 
 def load_leader_trajectory(
@@ -59,7 +61,7 @@ def load_leader_trajectory(
 class Scenario:
     """A fully-constructed OAC problem ready to solve in a receding-horizon loop."""
 
-    cfg: dict[str, Any]
+    cfg: DictConfig
     cost: observability_cost.ObservabilityCost
     controller: oac_ctrl.ObservabilityAwareController
     leader_dt: float
@@ -134,7 +136,7 @@ def build_rt_controller(
 
 
 def build_scenario(
-    config_path: str | Path = CONFIG_DIR / "quadrotor.toml",
+    config: DictConfig | dict[str, Any] | None = None,
     *,
     order: int | None = None,
     use_manifold: bool = False,
@@ -147,8 +149,11 @@ def build_scenario(
 
     Parameters
     ----------
-    config_path
-        Scenario TOML (defaults to ``config/quadrotor.toml``).
+    config
+        The scenario config (an OmegaConf/Hydra ``scenario``-group node, as the example
+        passes ``cfg.scenario``, or a plain dict). When ``None`` the default
+        ``examples/conf/scenario/quadrotor.yaml`` is loaded (standalone callers need no
+        Hydra context).
     order
         Override the STLOG order (baseline 5). Lower orders are a Phase-1 ablation.
     use_manifold
@@ -162,7 +167,7 @@ def build_scenario(
     integration
         ``"euler"`` (baseline) or ``"rk4"``.
     """
-    cfg = load_config(config_path)
+    cfg = OmegaConf.create(config) if config is not None else load_config()
     traj = load_leader_trajectory()
     leader_dt = float(traj["dt"])
     x_leader, u_leader = traj["x_leader"], traj["u_leader"]
@@ -202,7 +207,7 @@ def build_scenario(
     u_lb = np.tile(np.array(cfg["optim"]["lb"]), (window, N_ROBOTS))
     u_ub = np.tile(np.array(cfg["optim"]["ub"]), (window, N_ROBOTS))
 
-    options = dict(cfg["optim"]["options"])
+    options = OmegaConf.to_container(cfg["optim"]["options"], resolve=True)
     if maxiter is not None:
         options["maxiter"] = maxiter
 
