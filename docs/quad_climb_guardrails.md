@@ -770,3 +770,36 @@ So denser UWB is NOT a substitute for a 2nd anchor: it sharpens what geometry al
 cannot manufacture observability for the along-track gap, and it worsens the carried-EKF inconsistency there.
 The lever for that gap stays a CONSISTENT filter (FEJ/OC-EKF, section 6.13) or a sensor that observes the
 HORIZONTAL (a 2nd anchor). Reproduce: `experiments/baro_o0.py --seeds 20 --meas-hz 100`.
+
+### §6.17 Measurement RATE on (E1,O1): denser meas helps modestly; the real lever is EKF PREDICT INTEGRATION (`baro_o1.py`)
+
+Asked the §6.16 question on the O1 corner (lean relative-pose ESEKF + direct thrust+rates). Added sub-stepping
+to baro_o1.closed_loop: n_sub truth+IMU+EKF-predict sub-steps per 20 Hz OA replan (predict integration rate),
+fuse range/baro every meas_every sub-steps (measurement rate). The naive "100 Hz" run lifted everything hugely
+(1range 20->65%, 1range+baro 45->90%, 2range 45->80%, NEES collapsing) -- but sub-stepping confounds THREE
+things, so I disentangled them (1range, 20 seeds):
+
+| predict | meas  | proc        | %bnd | NEES | isolates                          |
+|---------|-------|-------------|------|------|-----------------------------------|
+| 20 Hz   | 20 Hz | x1 (base)   | 20%  | 135  | baseline                          |
+| 100 Hz  | 20 Hz | x1 (=5x tot)| 55%  | 27   | predict side (integ + 5x proc)    |
+| 100 Hz  | 20 Hz | CONSERVED   | 55%  | 394  | INTEGRATION alone (proc held)     |
+| 20 Hz   | 20 Hz | x5          | 0%   | 1466 | PROC-NOISE alone (coarse integ)   |
+| 100 Hz  | 100 Hz| x1          | 65%  | 117  | + denser measurements             |
+
+**VERDICT: the dominant lever is the EKF PREDICT INTEGRATION RATE, not measurements and not the process-noise
+floor.** Proc-conserved fine integration still hits 55% (so it's not the 5x proc injection); raising proc at
+coarse integration HURTS (0%). The lean O1 ESEKF integrates with EULER at the 0.05 s OA step -- too coarse on
+the nonlinear relative-pose (SE(3)+vel) manifold -- so its covariance is wrong and the carried loop is loose.
+Refining the predict to 0.01 s (sub-step, or use RK4 in `ErrorStateEKF(method=...)`) lifts boundedness +35 pp
+(1range 20->55%; at full 100 Hz, 1range+baro 45->90%, 2range 45->80%) and is the real driver of the apparent
+"100 Hz" win. **Denser MEASUREMENTS per se add only the same modest +10 pp seen on O0 (55->65%) and DEGRADE
+consistency (NEES 27->117)** -- not a lever (consistent with section 6.16).
+
+Implication: part of the O1 corner's earlier poor showing (o1_corner 12-50% bounded; the section 6.13 "carried
+ESEKF is confident-wrong, NEES ~1e3" consistency limit) is an INTEGRATION-RATE ARTIFACT, not fundamental --
+a coarse Euler predict on the manifold. The cheap fix is a finer/RK4 predict. WORTH RE-CHECKING the O1 results
+in sections 6.10/6.13/6.15 with a fine-integration ESEKF before trusting their ceilings. Caveats: lean
+estimator only (the full range-only ESEKF / the belief-space corner are untested at fine integration); the
+direct-control cap (section 6.10) still applies (corner stays <100%). Reproduce:
+`experiments/baro_o1.py --seeds 20 --predict-hz 100 --meas-hz 20 [--proc-scale 0.2]`.
