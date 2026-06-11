@@ -193,7 +193,16 @@ def _ahrs(q_true, rng):
 
 
 def run(
-    mode, ctrl, seed, *, driven="imu", ff_clip=0.0, l2_off=None, oac2=False, baro=False
+    mode,
+    ctrl,
+    seed,
+    *,
+    driven="imu",
+    ff_clip=0.0,
+    l2_off=None,
+    oac2=False,
+    baro=False,
+    meas_every=None,
 ):
     """One closed-loop run. mode in {oac, noac}; driven in {imu, cmd, truth}. ff_clip = max |accel
     feedforward| (0 = none). l2_off = constant offset of a 2nd KNOWN leader from leader 1 (None = single
@@ -201,6 +210,9 @@ def run(
     (build_oac2; requires l2_off) instead of planning on leader 1 only. Returns per-step recovery, NEES
     (pos block), true formation distance, OA solve wall time, vel-tracking error, commanded/achieved maneuver."""
     rng = np.random.default_rng(seed)
+    # measurement (range/baro) fusion cadence: every `meas_every` of the N_SUB (100 Hz) substeps. None =
+    # once per OAC step (= N_SUB, the 10 Hz default); 1 = every substep (100 Hz), 2 = 50 Hz. OAC still 10 Hz.
+    meas_every = meas_every or N_SUB
     sim = jax.jit(
         integrator.Integrator(qdyn, integrator.Methods.RK4, stepsize=DT / N_SUB)
     )
@@ -292,31 +304,37 @@ def run(
             r_hat = r_hat + (v_hat - LEADER_VEL) * dti  # noqa: PLR6104
             P = F @ P @ F.T + Gn @ Qa @ Gn.T
             t += dti
+            if (
+                (k + 1) % meas_every == 0
+            ):  # fuse range(s) + baro at the UWB rate (>= the 10 Hz OAC rate)
+                r_true = (
+                    xq[0:3] - LEADER_VEL * t
+                )  # follower position relative to leader 1
+                for off in (  # range update per KNOWN leader (leader i at constant offset `off`)
+                    [np.zeros(3)] if l2_off is None else [np.zeros(3), l2_off]
+                ):
+                    rr_hat, rr_true = r_hat - off, r_true - off
+                    rn = np.linalg.norm(rr_hat)
+                    H = np.r_[rr_hat / (rn + 1e-12), np.zeros(3)][None]
+                    z = np.linalg.norm(rr_true) + rng.normal(0, np.sqrt(RANGE_VAR))
+                    S = H @ P @ H.T + RANGE_VAR
+                    K = (P @ H.T) / S
+                    dxu = (K * (z - rn)).ravel()
+                    r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
+                    P = (np.eye(6) - K @ H) @ P
+                if baro:  # barometer: direct measurement of the relative vertical position r_z
+                    Hb = np.array([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+                    zb = r_true[2] + rng.normal(0, BARO_STD)
+                    Sb = Hb @ P @ Hb.T + BARO_STD**2
+                    Kb = (P @ Hb.T) / Sb
+                    dxu = (Kb * (zb - r_hat[2])).ravel()
+                    r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
+                    P = (np.eye(6) - Kb @ Hb) @ P
+                P = 0.5 * (P + P.T)
 
-        r_true = xq[0:3] - LEADER_VEL * t  # follower position relative to leader 1
-        offs = [np.zeros(3)] if l2_off is None else [np.zeros(3), l2_off]
-        for off in offs:  # range update for each KNOWN leader (leader i sits at constant offset `off`)
-            rr_hat, rr_true = (
-                r_hat - off,
-                r_true - off,
-            )  # vector from leader i to the follower
-            rn = np.linalg.norm(rr_hat)
-            H = np.r_[rr_hat / (rn + 1e-12), np.zeros(3)][None]
-            z = np.linalg.norm(rr_true) + rng.normal(0, np.sqrt(RANGE_VAR))
-            S = H @ P @ H.T + RANGE_VAR
-            K = (P @ H.T) / S
-            dxu = (K * (z - rn)).ravel()
-            r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
-            P = (np.eye(6) - K @ H) @ P
-        if baro:  # follower barometer: direct measurement of the relative vertical position r_z
-            Hb = np.array([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
-            zb = r_true[2] + rng.normal(0, BARO_STD)
-            Sb = Hb @ P @ Hb.T + BARO_STD**2
-            Kb = (P @ Hb.T) / Sb
-            dxu = (Kb * (zb - r_hat[2])).ravel()
-            r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
-            P = (np.eye(6) - Kb @ Hb) @ P
-        P = 0.5 * (P + P.T)
+        r_true = (
+            xq[0:3] - LEADER_VEL * t
+        )  # final follower position relative to leader 1
         if (
             driven == "truth"
         ):  # plan-on-truth diagnostic: re-anchor the estimate (isolates wiring vs INS)

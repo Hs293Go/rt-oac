@@ -42,8 +42,17 @@ def main():
         default=["1range", "1range+baro", "2range"],
         choices=["1range", "1range+baro", "2range"],
     )
+    ap.add_argument(
+        "--meas-hz",
+        type=float,
+        default=10.0,
+        help="measurement (range/baro) fusion rate [Hz]; OAC stays 10 Hz. 10=once/step, 50/100=denser UWB",
+    )
     args = ap.parse_args()
     clins.BARO_STD = args.baro_std
+    meas_every = max(
+        1, round(clins.N_SUB / (clins.DT * args.meas_hz))
+    )  # substeps between fusions
     configs = {
         "1range": (clins.build_oac, {"l2_off": None, "oac2": False, "baro": False}),
         "1range+baro": (
@@ -56,8 +65,8 @@ def main():
         "=== (E1,O0) DEPLOYABLE corner: barometer vs 2nd leader (flat-plan + tracker + translation INS) ==="
     )
     print(
-        f"{clins.STEPS} steps, {args.seeds} seeds, baro_std={args.baro_std} m; "
-        "bounded = recovery<1.5 m AND formation<15 m.\n"
+        f"{clins.STEPS} steps, {args.seeds} seeds, baro_std={args.baro_std} m, "
+        f"meas={args.meas_hz:.0f} Hz (OAC 10 Hz); bounded = recovery<1.5 m AND formation<15 m.\n"
     )
     print(
         f"{'config':>16} {'rec_med':>8} {'rec_p90':>8} {'NEES':>7} {'%bnd':>6} {'distMed':>8}"
@@ -67,7 +76,9 @@ def main():
         ctrl = build()
         rows = []
         for s in range(args.seeds):
-            errs, nees, dists, *_ = clins.run("oac", ctrl, s, driven="imu", **kw)
+            errs, nees, dists, *_ = clins.run(
+                "oac", ctrl, s, driven="imu", meas_every=meas_every, **kw
+            )
             bounded = errs[-1] < 1.5 and np.max(dists) < 15.0
             rows.append((errs[-1], np.median(nees), bounded, np.median(dists)))
         r = np.array(rows)

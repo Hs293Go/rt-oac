@@ -739,3 +739,34 @@ honest answer to "does (E1,O0) + 1range+baro get high boundedness?": yes (85%) b
 anchor. This CORRECTS the optimistic aside in §6.14 ("flat+track would lift it to ~95%"): flat+track lifts
 boundedness a lot (the O1 45% -> the O0 85%), but the barometer remains a genuinely weaker (cheap, deployable)
 substitute for a 2nd known anchor. Reproduce: `experiments/baro_o0.py --seeds 20`.
+
+### §6.16 Measurement RATE: denser UWB helps the OBSERVABLE directions, not the structural gap (`baro_o0.py --meas-hz`)
+
+Does fusing measurements faster help? OAC re-plans at 10 Hz, but a real UWB does 50-100 Hz. The sim already
+predicts the INS at 100 Hz (the N_SUB tracker substeps); added a `meas_every` knob to clins_closed_loop.run so
+range/baro fuse every k substeps (10 / 50 / 100 Hz) while OAC stays 10 Hz. 20 seeds:
+
+| observation     | 10 Hz: %bnd (NEES, rec) | 50 Hz        | 100 Hz: %bnd (NEES, rec) |
+|-----------------|-------------------------|--------------|--------------------------|
+| 1 range         | 25% (135, 2.89)         | --           | 30% (191, 2.31)          |
+| 1 range + baro  | 85% (18, 0.54)          | 90% (30, .64)| 85% (34, 0.89)           |
+| 2 ranges        | 95% (4.0, 0.26)         | --           | 100% (3.7, 0.35)         |
+
+**VERDICT: denser measurements help the directions that are ALREADY OBSERVABLE, and DO NOT close the
+structural along-track gap (and degrade consistency on it).**
+- **2 ranges (well-observed): denser HELPS** -- 95% -> 100% at 100 Hz, NEES stays consistent (4.0 -> 3.7).
+  Both tangentials are resolved by the two anchors + the maneuver, so faster fusion cleanly averages range
+  noise -> tighter + more bounded, still consistent. This is the deployable lever for the 2-anchor corner.
+- **1 range + baro (along-track WEAKLY observed): denser does NOT help and HURTS consistency** -- %bounded is
+  flat ~85-90% across 10->100 Hz (within the n=20 noise), while NEES RISES 18 -> 34 and recovery_med RISES
+  0.54 -> 0.89 m. The carried EKF gets MORE confident-wrong on the weak along-track direction with more
+  updates -- the section 6.13 consistency mechanism, amplified by measurement rate.
+
+Mechanism: the along-track is resolved by MOTION (geometry diversity), which 10 Hz already captures (the
+follower moves ~0.1 m per OAC step). 100 Hz samples the SAME trajectory more densely -- the geometry is
+correlated, only the noise is independent -- so the radial noise-averages but the structurally-weak tangential
+is geometry/consistency-limited, not sample-limited; extra updates on it just over-shrink P (overconfidence).
+So denser UWB is NOT a substitute for a 2nd anchor: it sharpens what geometry already makes observable, but it
+cannot manufacture observability for the along-track gap, and it worsens the carried-EKF inconsistency there.
+The lever for that gap stays a CONSISTENT filter (FEJ/OC-EKF, section 6.13) or a sensor that observes the
+HORIZONTAL (a 2nd anchor). Reproduce: `experiments/baro_o0.py --seeds 20 --meas-hz 100`.
