@@ -682,3 +682,33 @@ LIDAR+VIO port), NOT a better planning objective.
 the m6->m15 inversion disappears -> the corner was estimator-limited (rescuable, belief-space lives). If
 recovery stays flat with an honestly LARGE Sigma -> the corner is genuinely information-limited, and only the
 X-IO measurement-rich port (or more anchors) moves it. Reproduce: `experiments/belief_space_oac.py --seeds 20`.
+
+### §6.14 (E1,O1) VARIATION: a barometer substitutes for the 2nd leader (`baro_o1.py`)
+
+Tested whether a cheap onboard BAROMETER can replace the 2nd known leader in the (E1,O1) corner (a 2nd GNSS
+anchor is expensive; a baro is standard kit). The barometer measures the follower's absolute altitude --
+exact + differentiable from the relative state, `baro(x) = to_absolute_state(x_l1, x)[12]` -- added to BOTH
+the carried ESEKF and the O1 OA's STLOG. Geometric prediction: 1 range leaves the TWO tangential directions
+weak; a 2nd range removes one (a horizontal), a barometer removes a DIFFERENT one (the vertical); both leave
+ONE weak horizontal direction for the O1 maneuver. Held identical to o1_corner's closed corner (lean
+IMU-driven relative-pose ESEKF, direct thrust+rates O1 OA, quad truth+drag); only the OBSERVATION changes.
+
+Result (lean estimator, 20 seeds, baro_std 0.3 m): the barometer MATCHES the 2nd leader.
+
+| observation     | %bnd | rec_med | rec_p90 | NEES |
+|-----------------|------|---------|---------|------|
+| 1 range (floor) | 20%  | 3.45    | 19.9    | 8403 |
+| 1 range + baro  | 45%  | 1.59    | 6.0     | 627  |
+| 2 ranges (ref)  | 45%  | 1.72    | 4.5     | 1128 |
+
+**VERDICT: a barometer substitutes for the 2nd known anchor at the observation level** -- same lift off the
+range-only floor (20% -> 45%), comparable recovery + NEES, at near-zero deployment cost (no 2nd GNSS leader).
+The geometric "each sensor kills one weak tangential" picture holds.
+
+Caveats (don't oversell): (i) BOTH cap at 45% -- the ceiling here is the direct thrust+rates control
+destabilizing the carried estimate (the section 6.10 cap), NOT the observation; to lift further, put
+1range+baro on the flat+track architecture (where O0/O1 reach 75-95%). (ii) NEES stays ~1e3 -- the baro adds
+INFORMATION, not CONSISTENCY; the carried ESEKF is still loose (the section 6.13 consistency limit is
+untouched). (iii) Idealized baro (direct altitude + 0.3 m Gaussian noise); a real barometer carries a
+slowly-varying pressure (QNH) bias that would need a bias state and could erode the win. Next: 1range+baro on
+the flat+track loop, and a baro-noise sweep. Reproduce: `experiments/baro_o1.py --seeds 20`.
