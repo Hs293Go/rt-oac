@@ -89,6 +89,47 @@ def build_oac(order=ORDER):
     )
 
 
+BARO_STD = 0.3  # follower barometer altitude noise (m)
+
+
+def flat_obs_baro(
+    x, u=None
+):  # 1 range + both yaws + leader pos + follower ALTITUDE (barometer)
+    return jnp.array([
+        x[0],
+        x[1],
+        x[2],
+        x[3],
+        x[7],
+        jnp.linalg.norm(x[4:7] - x[0:3]),
+        x[6],
+    ])
+
+
+def build_oac_baro(order=ORDER):
+    cost = observability_cost.ObservabilityCost(
+        flat_dyn,
+        flat_obs_baro,
+        DT,
+        gramian_kw={"order": order, "var": np.r_[VAR, BARO_STD**2]},
+        gramian_metric=metrics.neg_softmin_eig,
+        observed_indices=(),
+    )
+    return RTController(
+        cost,
+        stlog_dt=STLOG_DT,
+        lb=FB_LB,
+        ub=FB_UB,
+        n_inputs=8,
+        follower_indices=(4, 5, 6, 7),
+        method="SLSQP",
+        maxiter=6,
+        constraint=interrobot_distance,
+        constraint_bounds=DIST_BOUNDS,
+        constraint_mode="hard",
+    )
+
+
 # --- 2-range OAC: 12-state [leader1(4), follower(4), leader2(4)]; both leaders KNOWN (directly observed),
 #     follower observed via BOTH ranges, so the STLOG worst-eigenvalue targets the follower fused by 2 anchors
 VAR2 = np.r_[
@@ -151,7 +192,9 @@ def _ahrs(q_true, rng):
     return (Rotation.from_rotvec(err) * Rotation.from_quat(q_true)).as_quat()
 
 
-def run(mode, ctrl, seed, *, driven="imu", ff_clip=0.0, l2_off=None, oac2=False):
+def run(
+    mode, ctrl, seed, *, driven="imu", ff_clip=0.0, l2_off=None, oac2=False, baro=False
+):
     """One closed-loop run. mode in {oac, noac}; driven in {imu, cmd, truth}. ff_clip = max |accel
     feedforward| (0 = none). l2_off = constant offset of a 2nd KNOWN leader from leader 1 (None = single
     leader); the INS then fuses ranges to both. oac2 = the OA planner uses the 12-state 2-range model
@@ -265,6 +308,14 @@ def run(mode, ctrl, seed, *, driven="imu", ff_clip=0.0, l2_off=None, oac2=False)
             dxu = (K * (z - rn)).ravel()
             r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
             P = (np.eye(6) - K @ H) @ P
+        if baro:  # follower barometer: direct measurement of the relative vertical position r_z
+            Hb = np.array([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+            zb = r_true[2] + rng.normal(0, BARO_STD)
+            Sb = Hb @ P @ Hb.T + BARO_STD**2
+            Kb = (P @ Hb.T) / Sb
+            dxu = (Kb * (zb - r_hat[2])).ravel()
+            r_hat, v_hat = r_hat + dxu[0:3], v_hat + dxu[3:6]
+            P = (np.eye(6) - Kb @ Hb) @ P
         P = 0.5 * (P + P.T)
         if (
             driven == "truth"

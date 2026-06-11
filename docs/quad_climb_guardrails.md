@@ -712,3 +712,30 @@ INFORMATION, not CONSISTENCY; the carried ESEKF is still loose (the section 6.13
 untouched). (iii) Idealized baro (direct altitude + 0.3 m Gaussian noise); a real barometer carries a
 slowly-varying pressure (QNH) bias that would need a bias state and could erode the win. Next: 1range+baro on
 the flat+track loop, and a baro-noise sweep. Reproduce: `experiments/baro_o1.py --seeds 20`.
+
+### §6.15 (E1,O0) DEPLOYABLE corner: barometer gets 85%, NOT the 2-leader 95% -- a FUNDAMENTAL gap (`baro_o0.py`)
+
+§6.14's barometer win was on the O1 corner, which is control-capped at 45% -- so it did not answer the real
+question: does a barometer reach high boundedness on the DEPLOYABLE (E1,O0) corner (clins flat-plan + tracker
++ carried IMU-driven translation INS, ~95% with 2 leaders)? Added a barometer mode to clins_closed_loop
+(`build_oac_baro`: the follower altitude x[6] in the flat STLOG; a direct r_z pseudo-measurement in the
+translation INS). 20 seeds:
+
+| observation          | %bnd | rec_med | NEES |
+|----------------------|------|---------|------|
+| 1 range (floor)      | 25%  | 2.89    | 135  |
+| 1 range + baro 0.1 m | 85%  | 0.54    | 18.8 |
+| 1 range + baro 0.3 m | 85%  | 0.54    | 18.4 |
+| 1 range + baro 1.0 m | 85%  | 0.81    | 32.0 |
+| 2 ranges (reference) | 95%  | 0.26    | 4.0  |
+
+**VERDICT: a barometer lifts the (E1,O0) loop to HIGH boundedness (25% -> 85%) at near-zero deployment cost --
+a strong, deployable result -- but it does NOT reach the 2-leader 95%, and that gap is FUNDAMENTAL, not a
+sensor-quality issue.** The 85% ceiling is INSENSITIVE to barometer precision (0.1 m -> 1.0 m all give 85%;
+only recovery/NEES degrade gracefully). The barometer observes radial + vertical and leaves the along-track
+horizontal tangential to the OA maneuver ALONE -- that residual is the ~15% that occasionally fails. The 2nd
+range, with the maneuver, resolves BOTH tangentials -> 95% and far tighter consistency (NEES 4 vs ~19). So the
+honest answer to "does (E1,O0) + 1range+baro get high boundedness?": yes (85%) but not parity with a 2nd
+anchor. This CORRECTS the optimistic aside in §6.14 ("flat+track would lift it to ~95%"): flat+track lifts
+boundedness a lot (the O1 45% -> the O0 85%), but the barometer remains a genuinely weaker (cheap, deployable)
+substitute for a 2nd known anchor. Reproduce: `experiments/baro_o0.py --seeds 20`.
