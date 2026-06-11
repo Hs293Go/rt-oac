@@ -22,6 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
+
 from observability_aware_control import observability_cost
 
 from . import tracking_cost

@@ -52,29 +52,25 @@ experiments/                           # trimmed, headless forks of the companio
 config/                                # scenario + ablation-matrix configs
 ```
 
-## Reuse, not copy
+## Vendored core
 
-The verified math (STLOG, Lie derivatives, integrator, models, EKF) is reused verbatim
-from the companion repo, declared as a **local editable dependency** via
-`[tool.uv.sources]` in `pyproject.toml`:
+The verified math (STLOG, Lie derivatives, integrator, models, EKF) is **vendored
+verbatim** from the companion repo into `src/`, as the `observability_aware_control` and
+`example_lib` packages alongside `rt_oac`. They import normally — no editable dependency,
+no `sys.path`/`PYTHONPATH` bootstrap. rt-oac declares only the deps the vendored modules
+actually import (`jax`, `equinox`, `scipy`, `numpy`, `matplotlib`, `rerun`); the
+companion's heavy deps (`jax[cuda12]`, casadi, pyqt5, minsnap-trajectories) are never
+pulled in, keeping the install minimal and CPU-only. The vendored trees are excluded from
+ruff so they stay byte-for-byte auditable against the source.
 
-```toml
-[tool.uv.sources]
-observability_aware_control = { path = "../observability_aware_control", editable = true }
-```
-
-The editable install exposes *both* companion packages (`observability_aware_control` and
-`example_lib`), so they import normally — no `sys.path`/`PYTHONPATH` bootstrap needed. The
-companion's heavy deps (`jax[cuda12]`, casadi, pyqt5, minsnap-trajectories) are excluded
-via `[tool.uv] override-dependencies` (the modules we use don't import them), keeping the
-install minimal and CPU-only. `import rt_oac` still enables JAX x64 and the persistent
-compile cache; it also appends the companion `src` to `sys.path` as a fallback for an
-*uninstalled* checkout (override with `OAC_SRC`).
+`import rt_oac` enables JAX x64 and the persistent compile cache. `COMPANION_SRC`
+(override with `OAC_SRC`) optionally points at a sibling companion checkout, used only to
+find reference-data files — not code.
 
 ## Running
 
 ```bash
-uv sync                                        # installs rt-oac + companion (editable)
+uv sync                                        # installs rt-oac (core is vendored under src/)
 JAX_PLATFORMS=cpu uv run python benchmarks/profile_solve.py
 uv run pytest                                  # tests
 ```

@@ -29,8 +29,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike
-from observability_aware_control import observability_cost
 from scipy import optimize
+
+from observability_aware_control import observability_cost
 
 FOLLOWER_INDICES = (4, 5, 6, 7)
 

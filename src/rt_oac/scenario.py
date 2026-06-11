@@ -17,15 +17,15 @@ import dataclasses
 from pathlib import Path
 from typing import Any
 
-from example_lib.models import inter_quadrotor_pose as mdl
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
+
+from example_lib.models import inter_quadrotor_pose as mdl
 from observability_aware_control import (
     integrator,
     observability_aware_controller as oac_ctrl,
     observability_cost,
 )
-from omegaconf import DictConfig, OmegaConf
-
 import rt_oac  # noqa: F401  (bootstraps companion src + x64)
 from rt_oac.controller import RTController
 

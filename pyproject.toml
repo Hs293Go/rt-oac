@@ -4,11 +4,12 @@ version = "0.0.1"
 description = "Real-time observability-aware control: faster solution of the OAC problem"
 license = { text = "MIT" }
 requires-python = ">=3.12"
-# Minimal, CPU-only dependency set. The verified STLOG / Lie-derivative / integrator
-# / model code is reused verbatim from the companion repo by placing its `src` on
-# PYTHONPATH (see env.sh / justfile / tests/conftest.py), NOT by installing it -- the
-# companion pyproject pulls jax[cuda12] + casadi + pyqt5 + rerun-sdk, none of which the
-# real-time (Jetson, CPU) target needs.
+# Minimal, CPU-only dependency set. The verified STLOG / Lie-derivative / integrator /
+# model code is vendored verbatim from the companion repo under src/ (the
+# `observability_aware_control` and `example_lib` packages) rather than installed -- the
+# companion pyproject pulls jax[cuda12] + casadi + pyqt5 + minsnap-trajectories, none of
+# which the real-time (Jetson, CPU) target needs. The deps below are exactly what the
+# vendored modules import (jax, equinox, scipy, numpy, matplotlib, rerun).
 dependencies = [
   "jax>=0.7.1",
   "equinox>=0.10.4",
@@ -17,12 +18,8 @@ dependencies = [
   "matplotlib>=3.10",
   "tqdm",
   # real-time visualization for the headline examples (matches the companion repo's rerun
-  # version so its example_lib.visualization helpers and logging APIs line up exactly)
+  # version so the vendored example_lib.visualization helpers and logging APIs line up)
   "rerun-sdk==0.24.1",
-  # The companion repo, as a local editable dependency (see [tool.uv.sources]). The
-  # editable install exposes BOTH its packages (observability_aware_control and
-  # example_lib), so they import without any sys.path/PYTHONPATH bootstrap.
-  "observability_aware_control",
   "hydra-core>=1.3.2",
 ]
 
@@ -30,30 +27,14 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Ship rt-oac plus the verified core vendored from the companion repo. All three packages
+# live under src/ and are bundled into the wheel.
 [tool.hatch.build.targets.wheel]
-packages = ["src/rt_oac"]
-
-# Reuse the companion repo's verified source as a local editable dependency. uv builds it
-# in place, so edits to the companion are picked up live, and both of its packages
-# (observability_aware_control + example_lib) become importable normally.
-[tool.uv.sources]
-observability_aware_control = { path = "../observability_aware_control", editable = true }
-
-[tool.uv]
-# The companion's pyproject declares heavy deps the Jetson/CPU real-time target does not
-# need; none of the modules we import pull them. Drop the CUDA jax extra and exclude the
-# GUI / symbolic / trajectory-gen packages via always-false markers.
-override-dependencies = [
-  "jax>=0.7.1",
-  "casadi; sys_platform == 'never'",
-  "pyqt5; sys_platform == 'never'",
-  "minsnap-trajectories; sys_platform == 'never'",
-]
+packages = ["src/rt_oac", "src/observability_aware_control", "src/example_lib"]
 
 [tool.pytest.ini_options]
 filterwarnings = "ignore::DeprecationWarning"
-# the companion package is an installed (editable) dependency; only rt-oac's own src
-# needs to be on the path for tests
+# All packages (rt_oac + the vendored companion core) live under src/.
 pythonpath = ["src"]
 
 [dependency-groups]
@@ -65,7 +46,15 @@ target-version = "py312"
 preview = true
 fix = true
 unsafe-fixes = true
-extend-exclude = [".venv", "venv", "build", "dist"]
+# Vendored verbatim from the companion repo -- keep byte-for-byte, do not lint/reformat
+# under rt-oac's stricter rules so it stays auditable as identical to the source.
+extend-exclude = [
+  ".venv", "venv", "build", "dist",
+  "src/observability_aware_control", "src/example_lib",
+]
+# Honor the excludes even when ruff is handed explicit paths (e.g. pre-commit passes the
+# changed-file list), so the vendored trees are never reformatted/relinted out of band.
+force-exclude = true
 
 [tool.ruff.format]
 docstring-code-format = true

@@ -44,10 +44,11 @@ the quaternion ordering match the simulated measurements automatically.
 
 import functools
 
-from example_lib import math
 import jax
 import jax.numpy as jnp
 import jax.numpy.linalg as jla
+
+from example_lib import math
 from observability_aware_control import integrator
 
 __all__ = ["ErrorStateEKF"]
